@@ -1,8 +1,12 @@
 require("dotenv").config();
+
 const express = require("express");
-const axios = require("axios");
 const http = require("http");
 const WebSocket = require("ws");
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const { spawn } = require("child_process");
 
 const app = express();
 const server = http.createServer(app);
@@ -10,30 +14,36 @@ const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 5000;
 
-const callSessions = {};
+// =====================
+// SESSION MEMORY
+// =====================
+const sessions = {};
 
+// =====================
+// COMPANY CONTEXT
+// =====================
 const COMPANY_CONTEXT = `
 You are a professional telecaller from Connect Ventures Services Pvt Ltd.
-You help businesses expand globally.
-
-Rules:
-- Speak only English
-- Max 2 sentences
-- Ask one question at a time
-- No pricing, no legal advice
+Speak short, max 2 sentences.
+Ask one question at a time.
+No pricing, no legal advice.
 `;
 
-const GREETING = "Hello, I am calling from Connect Ventures. Is this a good time to talk?";
+// =====================
+// GREETING
+// =====================
+const GREETING =
+  "Hello, I am calling from Connect Ventures. Is this a good time to talk?";
 
 // =====================
-// CLAUDE
+// CLAUDE (TEXT GENERATION)
 // =====================
 async function getAIResponse(callId, text) {
-  if (!callSessions[callId]) {
-    callSessions[callId] = { history: [] };
+  if (!sessions[callId]) {
+    sessions[callId] = { history: [] };
   }
 
-  const history = callSessions[callId].history;
+  const history = sessions[callId].history;
   history.push({ role: "user", content: text });
 
   try {
@@ -43,13 +53,14 @@ async function getAIResponse(callId, text) {
         model: "claude-haiku-4-5-20251001",
         max_tokens: 80,
         system: COMPANY_CONTEXT,
-        messages: history
+        messages: history,
       },
       {
         headers: {
           "x-api-key": process.env.ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01"
-        }
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
       }
     );
 
@@ -57,117 +68,169 @@ async function getAIResponse(callId, text) {
     history.push({ role: "assistant", content: reply });
 
     return reply;
-  } catch (e) {
-    console.error("Claude error:", e.message);
-    return "Could you repeat that?";
+  } catch (err) {
+    console.error("Claude error:", err.message);
+    return "Could you repeat that please?";
   }
 }
 
 // =====================
-// DEEPGRAM (STT)
+// DEEPGRAM STT
 // =====================
-async function speechToText(audioBuffer) {
+async function speechToText(buffer) {
   try {
     const res = await axios.post(
-      "https://api.deepgram.com/v1/listen",
-      audioBuffer,
+      "https://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000",
+      buffer,
       {
         headers: {
           Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
-          "Content-Type": "audio/wav"
-        }
+          "Content-Type": "application/octet-stream",
+        },
       }
     );
 
-    return res.data.results.channels[0].alternatives[0].transcript;
-  } catch (e) {
-    console.error("Deepgram error:", e.message);
+    return (
+      res.data.results?.channels?.[0]?.alternatives?.[0]?.transcript || ""
+    );
+  } catch (err) {
+    console.error("Deepgram error:", err.message);
     return "";
   }
 }
 
 // =====================
-// ELEVENLABS (TTS)
+// ELEVENLABS TTS (STREAM SAFE)
 // =====================
 async function textToSpeech(text) {
   try {
     const res = await axios.post(
       `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`,
       {
-        text: text,
-        model_id: "eleven_monolingual_v1"
+        text,
+        model_id: "eleven_monolingual_v1",
       },
       {
         headers: {
-          "xi-api-key": process.env.ELEVENLABS_API_KEY
+          "xi-api-key": process.env.ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
         },
-        responseType: "arraybuffer"
+        responseType: "arraybuffer",
       }
     );
 
+    // return mp3 base64
     return Buffer.from(res.data).toString("base64");
-  } catch (e) {
-    console.error("ElevenLabs error:", e.message);
+  } catch (err) {
+    console.error("ElevenLabs error:", err.message);
     return null;
   }
 }
 
 // =====================
-// WEBSOCKET
+// SAFE FFMPEG CONVERSION (NON-BLOCKING)
+// =====================
+function convertToMulaw(inputBuffer, callId) {
+  return new Promise((resolve, reject) => {
+    const ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg";
+
+    const ff = spawn(ffmpegPath, [
+      "-y",
+      "-i",
+      "pipe:0",
+      "-ar",
+      "8000",
+      "-ac",
+      "1",
+      "-f",
+      "mulaw",
+      "pipe:1",
+    ]);
+
+    let output = [];
+
+    ff.stdout.on("data", (d) => output.push(d));
+    ff.stderr.on("data", () => {});
+
+    ff.on("close", () => {
+      resolve(Buffer.concat(output));
+    });
+
+    ff.stdin.write(inputBuffer);
+    ff.stdin.end();
+  });
+}
+
+// =====================
+// WEBSOCKET SERVER
 // =====================
 wss.on("connection", (ws) => {
   const callId = Math.random().toString(36).substring(7);
 
   console.log("Connected:", callId);
 
-  ws.send(JSON.stringify({
-    type: "response",
-    text: GREETING
-  }));
+  sessions[callId] = { history: [] };
+
+  // greeting
+  ws.send(
+    JSON.stringify({
+      type: "text",
+      text: GREETING,
+    })
+  );
 
   ws.on("message", async (msg) => {
     try {
       const data = JSON.parse(msg.toString());
 
+      // =====================
+      // AUDIO INPUT FROM EXOTEL
+      // =====================
       if (data.event === "media") {
-        const audioBase64 = data.media.payload;
+        const audioBuffer = Buffer.from(data.media.payload, "base64");
 
-        // base64 → buffer
-        const audioBuffer = Buffer.from(audioBase64, "base64");
-
+        // STT
         const text = await speechToText(audioBuffer);
-
         if (!text) return;
 
         console.log("User:", text);
 
+        // AI
         const reply = await getAIResponse(callId, text);
 
-        const audioReply = await textToSpeech(reply);
+        // TTS
+        const mp3Base64 = await textToSpeech(reply);
+        if (!mp3Base64) return;
 
-        if (!audioReply) return;
+        const mp3Buffer = Buffer.from(mp3Base64, "base64");
 
-        ws.send(JSON.stringify({
-          event: "media",
-          media: {
-            payload: audioReply
-          }
-        }));
+        // convert to mulaw for telephony
+        const mulawBuffer = await convertToMulaw(mp3Buffer, callId);
+
+        // send back to Exotel
+        ws.send(
+          JSON.stringify({
+            event: "media",
+            media: {
+              payload: mulawBuffer.toString("base64"),
+            },
+          })
+        );
       }
-
-    } catch (e) {
-      console.error("WS error:", e.message);
+    } catch (err) {
+      console.error("WS error:", err.message);
     }
   });
 
   ws.on("close", () => {
-    delete callSessions[callId];
+    delete sessions[callId];
+    console.log("Closed:", callId);
   });
 });
 
 // =====================
 app.get("/", (req, res) => {
-  res.send("Voice bot running");
+  res.send("AI Voice Bot Running");
 });
 
 server.listen(PORT, () => {
