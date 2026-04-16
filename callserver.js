@@ -10,170 +10,166 @@ const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 5000;
 
-// =====================
-// MEMORY STORE
-// =====================
 const callSessions = {};
 
-// =====================
-// COMPANY CONTEXT (UNCHANGED - YOUR STRONG PART)
-// =====================
 const COMPANY_CONTEXT = `
 You are a professional telecaller from Connect Ventures Services Pvt Ltd.
-You help businesses expand globally: company formation, banking setup, tax compliance, annual maintenance, FEMA advisory.
+You help businesses expand globally.
 
 Rules:
 - Speak only English
-- Keep responses SHORT — max 2 sentences only
-- Be confident and polite
+- Max 2 sentences
 - Ask one question at a time
-- Collect: name, location, target country, service needed, business type, timeline
-- No pricing, no legal advice, no guarantees
-- If complex, suggest consultation
-- No special characters
+- No pricing, no legal advice
 `;
 
-// =====================
-// GREETING
-// =====================
-const GREETING = "Hello, I am calling from Connect Ventures. We help businesses expand globally. Is this a good time to talk?";
+const GREETING = "Hello, I am calling from Connect Ventures. Is this a good time to talk?";
 
 // =====================
-// AI FUNCTION (SAME BUT OPTIMIZED)
+// CLAUDE
 // =====================
-async function getAIResponse(callId, userSpeech) {
+async function getAIResponse(callId, text) {
   if (!callSessions[callId]) {
-    callSessions[callId] = {
-      history: [],
-      lead: {}
-    };
+    callSessions[callId] = { history: [] };
   }
 
-  const session = callSessions[callId];
-  session.history.push({ role: "user", content: userSpeech });
+  const history = callSessions[callId].history;
+  history.push({ role: "user", content: text });
 
   try {
-    const response = await Promise.race([
-      axios.post(
-        "https://api.anthropic.com/v1/messages",
-        {
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 80,
-          system: COMPANY_CONTEXT,
-          messages: session.history
-        },
-        {
-          headers: {
-            "x-api-key": process.env.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-          }
+    const res = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      {
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 80,
+        system: COMPANY_CONTEXT,
+        messages: history
+      },
+      {
+        headers: {
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01"
         }
-      ),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Claude timeout")), 8000)
-      )
-    ]);
+      }
+    );
 
-    const aiReply = response.data.content[0].text
-      .replace(/[*_#&<>]/g, "")
-      .trim();
+    const reply = res.data.content[0].text.trim();
+    history.push({ role: "assistant", content: reply });
 
-    session.history.push({ role: "assistant", content: aiReply });
-
-    console.log(`🤖 [${callId}] AI: ${aiReply}`);
-
-    return aiReply;
-
-  } catch (err) {
-    console.error("❌ AI Error:", err.message);
-    return "Could you tell me which country you want to expand into?";
+    return reply;
+  } catch (e) {
+    console.error("Claude error:", e.message);
+    return "Could you repeat that?";
   }
 }
 
 // =====================
-// WEBSOCKET HANDLER
+// DEEPGRAM (STT)
 // =====================
-wss.on("connection", (ws, req) => {
+async function speechToText(audioBuffer) {
+  try {
+    const res = await axios.post(
+      "https://api.deepgram.com/v1/listen",
+      audioBuffer,
+      {
+        headers: {
+          Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
+          "Content-Type": "audio/wav"
+        }
+      }
+    );
+
+    return res.data.results.channels[0].alternatives[0].transcript;
+  } catch (e) {
+    console.error("Deepgram error:", e.message);
+    return "";
+  }
+}
+
+// =====================
+// ELEVENLABS (TTS)
+// =====================
+async function textToSpeech(text) {
+  try {
+    const res = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}`,
+      {
+        text: text,
+        model_id: "eleven_monolingual_v1"
+      },
+      {
+        headers: {
+          "xi-api-key": process.env.ELEVENLABS_API_KEY
+        },
+        responseType: "arraybuffer"
+      }
+    );
+
+    return Buffer.from(res.data).toString("base64");
+  } catch (e) {
+    console.error("ElevenLabs error:", e.message);
+    return null;
+  }
+}
+
+// =====================
+// WEBSOCKET
+// =====================
+wss.on("connection", (ws) => {
   const callId = Math.random().toString(36).substring(7);
 
-  console.log(`🔌 New WS connection: ${callId}`);
+  console.log("Connected:", callId);
 
-  // INIT SESSION
-  callSessions[callId] = {
-    history: [],
-    lead: {}
-  };
-
-  // SEND GREETING
   ws.send(JSON.stringify({
     type: "response",
     text: GREETING
   }));
 
-  ws.on("message", async (message) => {
+  ws.on("message", async (msg) => {
     try {
-      const data = JSON.parse(message.toString());
+      const data = JSON.parse(msg.toString());
 
-      console.log(`📥 [${callId}] Incoming:`, data);
+      if (data.event === "media") {
+        const audioBase64 = data.media.payload;
 
-      // =====================
-      // HANDLE TEXT INPUT
-      // =====================
-      if (data.type === "input") {
+        // base64 → buffer
+        const audioBuffer = Buffer.from(audioBase64, "base64");
 
-        const userSpeech = data.text;
+        const text = await speechToText(audioBuffer);
 
-        if (!userSpeech || userSpeech.trim() === "") {
-          ws.send(JSON.stringify({
-            type: "response",
-            text: "Could you please repeat that?"
-          }));
-          return;
-        }
+        if (!text) return;
 
-        console.log(`🗣️ [${callId}] User: ${userSpeech}`);
+        console.log("User:", text);
 
-        const aiReply = await getAIResponse(callId, userSpeech);
+        const reply = await getAIResponse(callId, text);
+
+        const audioReply = await textToSpeech(reply);
+
+        if (!audioReply) return;
 
         ws.send(JSON.stringify({
-          type: "response",
-          text: aiReply
+          event: "media",
+          media: {
+            payload: audioReply
+          }
         }));
       }
 
-      // =====================
-      // OPTIONAL: HANDLE AUDIO (ADVANCED)
-      // =====================
-      if (data.type === "audio") {
-        console.log("🎧 Audio received (not implemented yet)");
-        // Later: integrate STT here
-      }
-
-    } catch (err) {
-      console.error("❌ WS Error:", err.message);
+    } catch (e) {
+      console.error("WS error:", e.message);
     }
   });
 
   ws.on("close", () => {
-    console.log(`❌ Connection closed: ${callId}`);
-
-    // CLEANUP
     delete callSessions[callId];
   });
 });
 
 // =====================
-// HEALTH CHECK
-// =====================
 app.get("/", (req, res) => {
-  res.send("🚀 WebSocket AI Voice Bot Running");
+  res.send("Voice bot running");
 });
 
-// =====================
-// START SERVER
-// =====================
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🔗 WS URL: wss://your-render-url`);
+  console.log("Server running on", PORT);
 });
