@@ -4,9 +4,9 @@ const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const axios = require("axios");
-const fs = require("fs");
-const path = require("path");
 const { spawn } = require("child_process");
+
+const ffmpegPath = require("ffmpeg-static"); // ✅ FIXED (IMPORTANT)
 
 const app = express();
 const server = http.createServer(app);
@@ -36,7 +36,7 @@ const GREETING =
   "Hello, I am calling from Connect Ventures. Is this a good time to talk?";
 
 // =====================
-// CLAUDE (TEXT GENERATION)
+// CLAUDE AI
 // =====================
 async function getAIResponse(callId, text) {
   if (!sessions[callId]) {
@@ -100,7 +100,7 @@ async function speechToText(buffer) {
 }
 
 // =====================
-// ELEVENLABS TTS (STREAM SAFE)
+// ELEVENLABS TTS
 // =====================
 async function textToSpeech(text) {
   try {
@@ -119,7 +119,6 @@ async function textToSpeech(text) {
       }
     );
 
-    // return mp3 base64
     return Buffer.from(res.data).toString("base64");
   } catch (err) {
     console.error("ElevenLabs error:", err.message);
@@ -128,12 +127,10 @@ async function textToSpeech(text) {
 }
 
 // =====================
-// SAFE FFMPEG CONVERSION (NON-BLOCKING)
+// FFMPEG CONVERSION (FIXED)
 // =====================
-function convertToMulaw(inputBuffer, callId) {
+function convertToMulaw(inputBuffer) {
   return new Promise((resolve, reject) => {
-    const ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg";
-
     const ff = spawn(ffmpegPath, [
       "-y",
       "-i",
@@ -156,13 +153,18 @@ function convertToMulaw(inputBuffer, callId) {
       resolve(Buffer.concat(output));
     });
 
+    ff.on("error", (err) => {
+      console.error("FFmpeg error:", err.message);
+      resolve(Buffer.alloc(0));
+    });
+
     ff.stdin.write(inputBuffer);
     ff.stdin.end();
   });
 }
 
 // =====================
-// WEBSOCKET SERVER
+// WEBSOCKET
 // =====================
 wss.on("connection", (ws) => {
   const callId = Math.random().toString(36).substring(7);
@@ -171,7 +173,6 @@ wss.on("connection", (ws) => {
 
   sessions[callId] = { history: [] };
 
-  // greeting
   ws.send(
     JSON.stringify({
       type: "text",
@@ -183,9 +184,6 @@ wss.on("connection", (ws) => {
     try {
       const data = JSON.parse(msg.toString());
 
-      // =====================
-      // AUDIO INPUT FROM EXOTEL
-      // =====================
       if (data.event === "media") {
         const audioBuffer = Buffer.from(data.media.payload, "base64");
 
@@ -204,10 +202,9 @@ wss.on("connection", (ws) => {
 
         const mp3Buffer = Buffer.from(mp3Base64, "base64");
 
-        // convert to mulaw for telephony
-        const mulawBuffer = await convertToMulaw(mp3Buffer, callId);
+        // CONVERT AUDIO
+        const mulawBuffer = await convertToMulaw(mp3Buffer);
 
-        // send back to Exotel
         ws.send(
           JSON.stringify({
             event: "media",
