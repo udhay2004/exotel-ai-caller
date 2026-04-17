@@ -1,20 +1,20 @@
 {
-  "name": "exotel-ai-caller",
+  "name": "exotel-voice-agent",
   "version": "1.0.0",
-  "description": "",
-  "main": "callserver.js",
+  "description": "AI Voice Agent with Exotel Integration",
+  "main": "callServer.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node callServer.js",
+    "dev": "node callServer.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "axios": "^1.15.0",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "ws": "^8.16.0",
-    "ffmpeg-static": "^5.x"
+    "express": "^4.18.2",
+    "ws": "^8.14.2",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "ffmpeg-static": "^5.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
