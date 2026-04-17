@@ -23,6 +23,37 @@ console.log("ELEVENLABS_VOICE_ID:", process.env.ELEVENLABS_VOICE_ID ? "✅ " + p
 console.log("ffmpegPath         :", ffmpegPath || "❌ NOT FOUND");
 console.log("=================\n");
 
+// ─── TEST FFMPEG ON STARTUP ───────────────────────────────────────────────────
+// Run a quick ffmpeg version check so we know immediately if it works
+(function testFfmpeg() {
+  if (!ffmpegPath) { console.error("[FFMPEG INIT] ❌ ffmpeg-static returned null — mulaw conversion will use JS fallback"); return; }
+  const ff = spawn(ffmpegPath, ["-version"]);
+  let out = "";
+  ff.stdout.on("data", d => out += d.toString());
+  ff.stderr.on("data", d => out += d.toString());
+  ff.on("close", code => {
+    if (code === 0) {
+      const ver = out.match(/ffmpeg version (\S+)/);
+      console.log("[FFMPEG INIT] ✅ ffmpeg ok:", ver ? ver[1] : "unknown version");
+      // Test if mulaw encoder is available
+      const ff2 = spawn(ffmpegPath, ["-encoders"]);
+      let enc = "";
+      ff2.stdout.on("data", d => enc += d.toString());
+      ff2.stderr.on("data", d => enc += d.toString());
+      ff2.on("close", () => {
+        if (enc.includes("pcm_mulaw")) {
+          console.log("[FFMPEG INIT] ✅ pcm_mulaw encoder available");
+        } else {
+          console.error("[FFMPEG INIT] ❌ pcm_mulaw encoder NOT found in this ffmpeg build — will use JS fallback");
+        }
+      });
+    } else {
+      console.error("[FFMPEG INIT] ❌ ffmpeg failed to run (code", code, ") — will use JS fallback");
+    }
+  });
+  ff.on("error", e => console.error("[FFMPEG INIT] ❌ spawn error:", e.message, "— will use JS fallback"));
+})();
+
 const sessions = {};
 
 const COMPANY_CONTEXT = `You are a professional telecaller from Connect Ventures Services Pvt Ltd.
@@ -31,68 +62,141 @@ No pricing, no legal advice. Be friendly and natural.`;
 
 const GREETING = "Hello, I am calling from Connect Ventures. Is this a good time to talk?";
 
-// 20ms frame at 8kHz mulaw = 160 bytes
 const MULAW_FRAME_BYTES = 160;
 const MULAW_FRAME_MS    = 20;
 
-// ─── FFMPEG via temp files ────────────────────────────────────────────────────
-// WHY TEMP FILES: When ffmpeg reads from stdin (pipe:0), it cannot seek
-// backwards to detect the audio format from the file header, so it sometimes
-// guesses wrong and passes the data through without decoding — producing
-// identical input/output sizes and playing raw MP3 bytes as mulaw (ghost noise).
-// Writing to a real file lets ffmpeg read the header properly and decode correctly.
-async function convertToMulaw(inputBuffer) {
-  const tmpIn  = path.join(os.tmpdir(), `cv_in_${Date.now()}_${Math.random().toString(36).slice(2)}.mp3`);
-  const tmpOut = path.join(os.tmpdir(), `cv_out_${Date.now()}_${Math.random().toString(36).slice(2)}.ul`);
+// ─── MANUAL LINEAR PCM → MULAW ENCODER (pure JS fallback) ────────────────────
+// This encodes 16-bit signed little-endian PCM samples to G.711 μ-law bytes.
+// Used when ffmpeg is unavailable or broken. No external deps.
+function pcm16ToMulaw(pcmBuf) {
+  const BIAS = 0x84;
+  const CLIP = 32635;
+  const out  = Buffer.alloc(pcmBuf.length / 2);
+  for (let i = 0, j = 0; i < pcmBuf.length; i += 2, j++) {
+    let sample = pcmBuf.readInt16LE(i);
+    const sign = (sample < 0) ? 0x80 : 0;
+    if (sample < 0) sample = -sample;
+    if (sample > CLIP) sample = CLIP;
+    sample += BIAS;
+    let exp = 7;
+    for (let expMask = 0x4000; (sample & expMask) === 0 && exp > 0; exp--, expMask >>= 1) {}
+    const mantissa = (sample >> (exp + 3)) & 0x0f;
+    out[j] = ~(sign | (exp << 4) | mantissa) & 0xff;
+  }
+  return out;
+}
+
+// ─── DECODE MP3 → PCM16 via Web Audio style: use ffmpeg to raw PCM, then mulaw
+// Two-step: MP3 → PCM16LE (always works) → manual mulaw encode
+async function convertToMulawViaPCM(inputBuffer) {
+  const tmpIn = path.join(os.tmpdir(), `cv_in_${Date.now()}_${Math.random().toString(36).slice(2)}.mp3`);
+  const tmpOut = path.join(os.tmpdir(), `cv_pcm_${Date.now()}_${Math.random().toString(36).slice(2)}.raw`);
 
   try {
     fs.writeFileSync(tmpIn, inputBuffer);
-    console.log(`[FFMPEG] Input: ${inputBuffer.length} bytes → ${tmpIn}`);
+    console.log(`[FFMPEG-PCM] Wrote ${inputBuffer.length}B to ${tmpIn}`);
 
     await new Promise((resolve, reject) => {
       const ff = spawn(ffmpegPath, [
         "-y",
-        "-i",      tmpIn,        // real file: ffmpeg auto-detects format from header
-        "-ar",     "8000",       // 8 kHz sample rate
-        "-ac",     "1",          // mono
-        "-acodec", "pcm_mulaw",  // G.711 μ-law codec
-        "-f",      "mulaw",      // raw mulaw container (no WAV header)
+        "-i",      tmpIn,
+        "-ar",     "8000",
+        "-ac",     "1",
+        "-f",      "s16le",   // signed 16-bit little-endian PCM — universally supported
+        "-acodec", "pcm_s16le",
         tmpOut,
       ]);
 
       let stderr = "";
       ff.stderr.on("data", d => { stderr += d.toString(); });
       ff.on("close", code => {
-        if (code === 0 && fs.existsSync(tmpOut)) resolve();
-        else {
-          console.error("[FFMPEG] ❌ code:", code);
-          console.error("[FFMPEG] stderr:", stderr.slice(-1000));
-          reject(new Error(`ffmpeg exited with code ${code}`));
+        if (code === 0 && fs.existsSync(tmpOut)) {
+          resolve();
+        } else {
+          console.error("[FFMPEG-PCM] ❌ exit code:", code);
+          // Print last 500 chars of stderr so we can see what went wrong
+          console.error("[FFMPEG-PCM] stderr tail:", stderr.slice(-500));
+          reject(new Error(`ffmpeg PCM conversion failed (code ${code})`));
         }
       });
-      ff.on("error", reject);
+      ff.on("error", e => {
+        console.error("[FFMPEG-PCM] spawn error:", e.message);
+        reject(e);
+      });
     });
 
-    const out = fs.readFileSync(tmpOut);
-    const ratio = (out.length / inputBuffer.length).toFixed(2);
-    console.log(`[FFMPEG] ✅ Output: ${out.length} bytes mulaw (ratio: ${ratio}x vs input)`);
+    const pcm = fs.readFileSync(tmpOut);
+    console.log(`[FFMPEG-PCM] ✅ Got ${pcm.length}B PCM (ratio: ${(pcm.length / inputBuffer.length).toFixed(2)}x vs mp3)`);
 
-    // Guard: if sizes are equal, conversion silently failed
-    if (out.length === inputBuffer.length) {
-      throw new Error("ffmpeg output size equals input — MP3 was NOT decoded. Check ffmpeg build.");
-    }
-    if (out.length < 800) {
-      throw new Error(`ffmpeg output too small (${out.length} bytes) — likely silence or error`);
-    }
+    if (pcm.length < 800) throw new Error(`PCM output too small: ${pcm.length}B`);
 
-    return out;
+    // Manual encode PCM → mulaw (no ffmpeg mulaw encoder needed)
+    const mulaw = pcm16ToMulaw(pcm);
+    console.log(`[MULAW-JS] ✅ Encoded ${pcm.length}B PCM → ${mulaw.length}B mulaw`);
+    return mulaw;
+
   } finally {
     try { fs.unlinkSync(tmpIn);  } catch {}
     try { fs.unlinkSync(tmpOut); } catch {}
   }
 }
 
-// ─── TTS: ElevenLabs → MP3 buffer ────────────────────────────────────────────
+// ─── FFMPEG DIRECT MULAW (original approach, kept as primary attempt) ─────────
+async function convertToMulawDirect(inputBuffer) {
+  const tmpIn  = path.join(os.tmpdir(), `cv_in_${Date.now()}_${Math.random().toString(36).slice(2)}.mp3`);
+  const tmpOut = path.join(os.tmpdir(), `cv_ul_${Date.now()}_${Math.random().toString(36).slice(2)}.ul`);
+
+  try {
+    fs.writeFileSync(tmpIn, inputBuffer);
+
+    await new Promise((resolve, reject) => {
+      const ff = spawn(ffmpegPath, [
+        "-y", "-i", tmpIn,
+        "-ar", "8000", "-ac", "1",
+        "-acodec", "pcm_mulaw",
+        "-f", "mulaw",
+        tmpOut,
+      ]);
+      let stderr = "";
+      ff.stderr.on("data", d => { stderr += d.toString(); });
+      ff.on("close", code => {
+        if (code === 0 && fs.existsSync(tmpOut)) resolve();
+        else reject(new Error(`ffmpeg direct mulaw failed (code ${code})\n${stderr.slice(-300)}`));
+      });
+      ff.on("error", reject);
+    });
+
+    const out = fs.readFileSync(tmpOut);
+    if (out.length === inputBuffer.length) throw new Error("Output size equals input — not converted");
+    if (out.length < 800) throw new Error(`Output too small: ${out.length}B`);
+    console.log(`[FFMPEG-DIRECT] ✅ ${inputBuffer.length}B → ${out.length}B mulaw (${(out.length/inputBuffer.length).toFixed(2)}x)`);
+    return out;
+
+  } finally {
+    try { fs.unlinkSync(tmpIn);  } catch {}
+    try { fs.unlinkSync(tmpOut); } catch {}
+  }
+}
+
+// ─── MAIN CONVERTER: tries direct mulaw, falls back to PCM+JS encode ──────────
+async function convertToMulaw(inputBuffer) {
+  if (!ffmpegPath) {
+    console.error("[CONVERT] ❌ No ffmpeg — cannot decode MP3 without it");
+    throw new Error("ffmpeg not available");
+  }
+
+  // Try direct mulaw conversion first
+  try {
+    return await convertToMulawDirect(inputBuffer);
+  } catch (e) {
+    console.warn("[CONVERT] Direct mulaw failed:", e.message, "→ trying PCM+JS path");
+  }
+
+  // Fallback: ffmpeg to raw PCM, then manual JS mulaw encode
+  return await convertToMulawViaPCM(inputBuffer);
+}
+
+// ─── TTS: ElevenLabs ─────────────────────────────────────────────────────────
 async function ttsElevenLabs(text) {
   const key     = process.env.ELEVENLABS_API_KEY;
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
@@ -118,24 +222,17 @@ async function ttsElevenLabs(text) {
   );
 
   const buf = Buffer.from(res.data);
+  if (buf[0] === 0x7b) throw new Error("ElevenLabs API error: " + buf.toString("utf8").slice(0, 200));
 
-  // JSON error response starts with '{' (0x7b)
-  if (buf[0] === 0x7b) {
-    throw new Error("ElevenLabs API error: " + buf.toString("utf8").slice(0, 200));
-  }
-
-  // Verify MP3 magic bytes: ID3 tag (49 44 33) or MPEG sync word (ff ex)
   const isMP3 = (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33)
              || (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0);
-  if (!isMP3) {
-    throw new Error(`Unexpected format from ElevenLabs, header: ${buf.slice(0,4).toString("hex")}`);
-  }
+  if (!isMP3) throw new Error(`Unexpected ElevenLabs format: ${buf.slice(0,4).toString("hex")}`);
 
   console.log(`[TTS] ✅ ElevenLabs MP3: ${buf.length} bytes`);
   return buf;
 }
 
-// ─── TTS: Google Translate fallback → MP3 buffer ─────────────────────────────
+// ─── TTS: Google Translate fallback ──────────────────────────────────────────
 async function ttsGoogle(text) {
   console.log("[TTS] Google TTS fallback...");
   const encoded = encodeURIComponent(text);
@@ -151,10 +248,8 @@ async function ttsGoogle(text) {
   });
 
   const buf = Buffer.from(res.data);
-  console.log(`[TTS] Google response: ${buf.length} bytes, header hex: ${buf.slice(0,8).toString("hex")}`);
-
-  if (buf.length < 200) throw new Error(`Google TTS suspiciously small: ${buf.length} bytes`);
-
+  console.log(`[TTS] Google: ${buf.length}B, header: ${buf.slice(0,8).toString("hex")}`);
+  if (buf.length < 200) throw new Error(`Google TTS too small: ${buf.length}B`);
   return buf;
 }
 
@@ -250,7 +345,7 @@ async function sendAudioToExotel(ws, streamSid, text) {
       ws.send(JSON.stringify({ event: "mark", stream_sid: streamSid, mark: { name: "done" } }));
     }
 
-    console.log(`[SEND] ✅ ${frameCount} frames × ${MULAW_FRAME_BYTES}B = ${mulaw.length} bytes sent`);
+    console.log(`[SEND] ✅ ${frameCount} frames × ${MULAW_FRAME_BYTES}B = ${mulaw.length}B sent`);
   } catch (e) {
     console.error("[SEND] ❌", e.message);
   }
@@ -278,7 +373,7 @@ wss.on("connection", (ws, req) => {
     catch { return; }
 
     if (session.msgCount <= 5) {
-      console.log(`[WS] #${session.msgCount}:`, JSON.stringify(data).slice(0, 300));
+      console.log(`[WS] Event #${session.msgCount} raw:`, JSON.stringify(data).slice(0, 300));
     }
 
     switch (data.event) {
@@ -290,7 +385,9 @@ wss.on("connection", (ws, req) => {
         const sid = data.stream_sid || data.start?.stream_sid
                  || data.streamSid  || data.start?.streamSid;
         session.streamSid = sid;
-        console.log(`[WS] start ✓ | stream_sid=${sid}`);
+        const from = data.start?.from || data.from || "?";
+        const to   = data.start?.to   || data.to   || "?";
+        console.log(`[WS] start ✓ | stream_sid=${sid} | from=${from} → to=${to}`);
         if (!session.greetingSent) {
           session.greetingSent = true;
           await sendAudioToExotel(ws, sid, GREETING);
@@ -344,8 +441,8 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", (code) => {
-    console.log(`[WS] ❌ Closed | callId=${callId} | code=${code}`);
+  ws.on("close", (code, reason) => {
+    console.log(`[WS] ❌ Closed | callId=${callId} | code=${code} | reason=${reason}`);
     if (sessions[callId]?.silenceTimer) clearTimeout(sessions[callId].silenceTimer);
     delete sessions[callId];
   });
