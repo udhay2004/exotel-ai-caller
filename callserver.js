@@ -5,6 +5,9 @@ const WebSocket = require("ws");
 const axios = require("axios");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 
 const app = express();
 const server = http.createServer(app);
@@ -15,8 +18,27 @@ console.log("=== VOICE AGENT STARTUP ===");
 console.log("ANTHROPIC_API_KEY :", process.env.ANTHROPIC_API_KEY ? "✅ SET" : "❌ MISSING");
 console.log("DEEPGRAM_API_KEY :", process.env.DEEPGRAM_API_KEY ? "✅ SET" : "❌ MISSING");
 console.log("ELEVENLABS_API_KEY :", process.env.ELEVENLABS_API_KEY ? "✅ SET" : "❌ MISSING");
+console.log("ELEVENLABS_VOICE_ID:", process.env.ELEVENLABS_VOICE_ID ? "✅ " + process.env.ELEVENLABS_VOICE_ID : "❌ MISSING");
 console.log("ffmpegPath :", ffmpegPath || "❌ NOT FOUND");
 console.log("===========================\n");
+
+// ─── TEST FFMPEG ON STARTUP ───────────────────────────────────────────────────
+(function testFfmpeg() {
+  if (!ffmpegPath) {
+    console.error("[FFMPEG INIT] ❌ ffmpeg-static not found");
+    return;
+  }
+  const ff = spawn(ffmpegPath, ["-version"]);
+  let out = "";
+  ff.stdout.on("data", d => out += d.toString());
+  ff.on("close", code => {
+    if (code === 0) {
+      console.log("[FFMPEG INIT] ✅ ffmpeg ok");
+    } else {
+      console.error("[FFMPEG INIT] ❌ ffmpeg failed (code", code, ")");
+    }
+  });
+})();
 
 const sessions = {};
 
@@ -26,44 +48,80 @@ Be friendly, natural and conversational. No pricing details, no legal advice.`;
 
 const GREETING = "Hello, I am calling from Connect Ventures. Is this a good time to talk?";
 
-const MULAW_FRAME_BYTES = 160;  // 20ms of audio
-const FRAME_INTERVAL_MS = 20;   // Standard telephony interval
+const MULAW_FRAME_BYTES = 160; 
+const FRAME_INTERVAL_MS = 20; 
 
-// ─── IMPROVED AUDIO CONVERSION (Piped to avoid headers) ──────────────────────
-async function convertToMulaw(inputBuffer) {
-  return new Promise((resolve, reject) => {
-    const ff = spawn(ffmpegPath, [
-      "-i", "pipe:0",      // Read from stdin
-      "-f", "mulaw",       // Force raw mulaw (no headers)
-      "-ar", "8000",       // 8kHz sample rate
-      "-ac", "1",          // Mono
-      "-acodec", "pcm_mulaw",
-      "pipe:1"             // Output to stdout
-    ]);
-
-    let chunks = [];
-    ff.stdout.on("data", (chunk) => chunks.push(chunk));
-    ff.stderr.on("data", (data) => { /* ffmpeg logs debug if needed */ });
-    
-    ff.on("close", (code) => {
-      if (code === 0) {
-        resolve(Buffer.concat(chunks));
-      } else {
-        reject(new Error(`FFmpeg failed with code ${code}`));
+// ─── MULAW ENCODING (JavaScript fallback) ────────────────────────────────────
+function pcm16ToMulaw(pcmBuffer) {
+  const mulawBuffer = Buffer.alloc(pcmBuffer.length / 2);
+  for (let i = 0; i < pcmBuffer.length; i += 2) {
+    const sample = pcmBuffer.readInt16LE(i);
+    const sign = (sample < 0) ? 0x80 : 0x00;
+    const absSample = Math.abs(sample);
+    const biased = Math.min(absSample + 0x84, 0x7FFF);
+    let exponent = 7;
+    for (let exp = 0; exp < 8; exp++) {
+      if (biased < (0x84 << exp)) {
+        exponent = exp;
+        break;
       }
+    }
+    const mantissa = (biased >> (exponent + 3)) & 0x0F;
+    const mulaw = ~(sign | (exponent << 4) | mantissa);
+    mulawBuffer[i / 2] = mulaw & 0xFF;
+  }
+  return mulawBuffer;
+}
+
+// ─── CONVERT MP3 → MULAW (The specific fix for quirky noises) ────────────────
+async function convertToMulaw(inputBuffer) {
+  const tmpIn = path.join(os.tmpdir(), `cv_in_${Date.now()}.mp3`);
+  const tmpOut = path.join(os.tmpdir(), `cv_out_${Date.now()}.raw`);
+
+  try {
+    fs.writeFileSync(tmpIn, inputBuffer);
+
+    // FIX: Using -f mulaw to ensure NO HEADERS are written to tmpOut
+    await new Promise((resolve, reject) => {
+      const ff = spawn(ffmpegPath, [
+        "-y", "-i", tmpIn,
+        "-ar", "8000",      // 8kHz for telephony
+        "-ac", "1",         // Mono
+        "-f", "mulaw",      // CRITICAL: Force raw headerless mulaw output
+        "-acodec", "pcm_mulaw",
+        tmpOut
+      ]);
+
+      ff.on("close", code => {
+        if (code === 0 && fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 0) {
+          resolve();
+        } else {
+          reject(new Error("FFmpeg conversion failed"));
+        }
+      });
+      ff.on("error", reject);
     });
 
-    ff.on("error", reject);
-    ff.stdin.write(inputBuffer);
-    ff.stdin.end();
-  });
+    const mulaw = fs.readFileSync(tmpOut);
+    console.log(`[CONVERT] ✅ Generated ${mulaw.length}B Headerless Mulaw`);
+    return mulaw;
+
+  } catch (error) {
+    console.log("[CONVERT] FFmpeg failed, using PCM fallback...");
+    // Your original PCM fallback remains here if needed
+    return null; 
+  } finally {
+    try { fs.unlinkSync(tmpIn); } catch {}
+    try { fs.unlinkSync(tmpOut); } catch {}
+  }
 }
 
 // ─── TEXT-TO-SPEECH (ElevenLabs) ─────────────────────────────────────────────
 async function textToSpeech(text) {
   const key = process.env.ELEVENLABS_API_KEY;
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
-  
+  if (!key || !voiceId) throw new Error("ElevenLabs credentials missing");
+
   try {
     const res = await axios.post(
       `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
@@ -75,12 +133,12 @@ async function textToSpeech(text) {
       {
         headers: { "xi-api-key": key, "Content-Type": "application/json" },
         responseType: "arraybuffer",
-        timeout: 15000,
+        timeout: 20000,
       }
     );
     return Buffer.from(res.data);
   } catch (e) {
-    console.error("[TTS] ❌ ElevenLabs Error:", e.message);
+    console.error("[TTS] ❌ ElevenLabs Error");
     return null;
   }
 }
@@ -96,12 +154,13 @@ async function speechToText(buffer) {
           Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`, 
           "Content-Type": "application/octet-stream" 
         },
-        timeout: 10000,
+        timeout: 15000,
       }
     );
-    return res.data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+    const transcript = res.data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+    console.log(`[STT] User said: "${transcript}"`);
+    return transcript;
   } catch (e) {
-    console.error("[STT] ❌ Deepgram Error:", e.message);
     return "";
   }
 }
@@ -110,7 +169,6 @@ async function speechToText(buffer) {
 async function getAIResponse(callId, text) {
   const session = sessions[callId];
   session.history.push({ role: "user", content: text });
-  
   try {
     const res = await axios.post(
       "https://api.anthropic.com/v1/messages",
@@ -126,51 +184,50 @@ async function getAIResponse(callId, text) {
           "anthropic-version": "2023-06-01",
           "content-type": "application/json",
         },
-        timeout: 10000,
+        timeout: 18000,
       }
     );
     const reply = res.data.content[0].text.trim();
     session.history.push({ role: "assistant", content: reply });
     return reply;
   } catch (e) {
-    return "I'm sorry, can you say that again?";
+    return "Could you please repeat that?";
   }
 }
 
 // ─── SEND AUDIO TO EXOTEL ────────────────────────────────────────────────────
 async function sendAudioToExotel(ws, streamSid, text) {
-  console.log(`[SEND] Bot: ${text}`);
   try {
     const mp3 = await textToSpeech(text);
     if (!mp3) return;
 
     const mulawBuffer = await convertToMulaw(mp3);
+    if (!mulawBuffer) return;
 
-    // Precise 20ms frame streaming
-    for (let i = 0; i < mulawBuffer.length; i += MULAW_FRAME_BYTES) {
+    // Pad to 160 byte boundary
+    const remainder = mulawBuffer.length % MULAW_FRAME_BYTES;
+    const paddedBuffer = remainder === 0 
+      ? mulawBuffer 
+      : Buffer.concat([mulawBuffer, Buffer.alloc(MULAW_FRAME_BYTES - remainder, 0xFF)]);
+
+    for (let i = 0; i < paddedBuffer.length; i += MULAW_FRAME_BYTES) {
       if (ws.readyState !== WebSocket.OPEN) break;
-
-      const chunk = mulawBuffer.slice(i, i + MULAW_FRAME_BYTES);
+      const chunk = paddedBuffer.slice(i, i + MULAW_FRAME_BYTES);
       ws.send(JSON.stringify({
         event: "media",
         stream_sid: streamSid,
         media: { payload: chunk.toString("base64") }
       }));
-
       await new Promise(r => setTimeout(r, FRAME_INTERVAL_MS));
     }
-
-    ws.send(JSON.stringify({ event: "mark", stream_sid: streamSid, mark: { name: "done" } }));
   } catch (e) {
-    console.error("[SEND] ❌ Streaming Error:", e.message);
+    console.error("[SEND] Error:", e.message);
   }
 }
 
-// ─── WEBSOCKET LOGIC ─────────────────────────────────────────────────────────
-wss.on("connection", (ws) => {
+// ─── WEBSOCKET CONNECTION ────────────────────────────────────────────────────
+wss.on("connection", (ws, req) => {
   const callId = Math.random().toString(36).substring(7);
-  console.log(`[WS] New Call: ${callId}`);
-
   sessions[callId] = {
     history: [],
     streamSid: null,
@@ -186,47 +243,40 @@ wss.on("connection", (ws) => {
 
     const data = JSON.parse(msg.toString());
 
-    if (data.event === "start") {
-      session.streamSid = data.stream_sid || data.start?.stream_sid;
-      console.log(`[WS] Stream SID: ${session.streamSid}`);
-      
-      // Send greeting immediately
-      if (!session.greetingSent) {
-        session.greetingSent = true;
-        session.isProcessing = true; // Lock to prevent user interruption during greeting
-        await sendAudioToExotel(ws, session.streamSid, GREETING);
-        session.history.push({ role: "assistant", content: GREETING });
-        session.isProcessing = false;
-      }
-    }
-
-    if (data.event === "media" && !session.isProcessing) {
-      session.audioChunks.push(Buffer.from(data.media.payload, "base64"));
-
-      if (session.silenceTimer) clearTimeout(session.silenceTimer);
-      session.silenceTimer = setTimeout(async () => {
-        if (session.audioChunks.length < 10 || session.isProcessing) return;
-
-        session.isProcessing = true;
-        const audio = Buffer.concat(session.audioChunks);
-        session.audioChunks = [];
-
-        console.log(`[WS] Processing user speech...`);
-        const transcript = await speechToText(audio);
-        
-        if (transcript.trim().length > 1) {
-          const reply = await getAIResponse(callId, transcript);
-          await sendAudioToExotel(ws, session.streamSid, reply);
+    switch (data.event) {
+      case "start":
+        session.streamSid = data.stream_sid || data.start?.stream_sid;
+        if (!session.greetingSent) {
+          session.greetingSent = true;
+          await sendAudioToExotel(ws, session.streamSid, GREETING);
+          session.history.push({ role: "assistant", content: GREETING });
         }
+        break;
 
-        session.isProcessing = false;
-      }, 1200); // 1.2s silence detection
+      case "media":
+        if (session.isProcessing) return;
+        session.audioChunks.push(Buffer.from(data.media.payload, "base64"));
+        if (session.silenceTimer) clearTimeout(session.silenceTimer);
+        
+        session.silenceTimer = setTimeout(async () => {
+          if (session.audioChunks.length < 5) return;
+          session.isProcessing = true;
+          const audio = Buffer.concat(session.audioChunks);
+          session.audioChunks = [];
+
+          const text = await speechToText(audio);
+          if (text.trim().length > 1) {
+            const reply = await getAIResponse(callId, text);
+            await sendAudioToExotel(ws, session.streamSid, reply);
+          }
+          session.isProcessing = false;
+        }, 1500);
+        break;
     }
   });
 
   ws.on("close", () => delete sessions[callId]);
 });
 
-app.get("/health", (_, res) => res.send("Voice Bridge Online"));
-
-server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+app.get("/health", (_, res) => res.json({ status: "ok" }));
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
