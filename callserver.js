@@ -218,13 +218,14 @@ async function streamTTSbyCamb(text, ws, streamSid) {
       "https://client.camb.ai/apis/tts-stream",
       {
         text,
-        language:     "en",            // ✅ FIXED: was "en-in" (unsupported by mars-flash)
+        // CAMB.AI language enum — "english" is the correct string for mars-flash.
+        // "en" and "en-in" both cause 422. Their API uses full-word language names.
+        language:     "english",
         voice_id:     voiceId,
         speech_model: "mars-flash",
-        // Note: output_configuration.format is ignored by CAMB.AI's streaming endpoint.
-        // It always returns WAV. The ffmpeg fix above handles this.
-        voice_settings:    { speaking_rate: 1.05 },
-        inference_options: { stability: 0.6, temperature: 0.7, speaker_similarity: 0.7 },
+        // `inference_options` is NOT a valid field for mars-flash → causes 422. Removed.
+        // `voice_settings` is valid.
+        voice_settings: { speaking_rate: 1.05 },
       },
       {
         headers:      { "x-api-key": apiKey, "Content-Type": "application/json" },
@@ -234,6 +235,11 @@ async function streamTTSbyCamb(text, ws, streamSid) {
     );
   } catch (err) {
     ff.kill();
+    // Log the full response body on 4xx so we can see exactly what CAMB.AI rejected
+    if (err.response) {
+      const body = JSON.stringify(err.response.data).slice(0, 300);
+      console.error(`[TTS/CAMB] HTTP ${err.response.status}: ${body}`);
+    }
     throw err;
   }
 
@@ -271,7 +277,9 @@ async function streamTTSbyElevenLabs(text, ws, streamSid) {
     data: {
       text,
       model_id:       "eleven_turbo_v2",
-      output_format:  "pcm_16000",     // ✅ FIXED: raw PCM at 16kHz, no container overhead
+      // pcm_16000 requires Starter plan+ → causes 401 on free tier. Revert to mp3.
+      // mp3_44100_128 works on ALL plan tiers including free.
+      output_format:  "mp3_44100_128",
       voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.0 },
     },
     headers:      { "xi-api-key": apiKey, "Content-Type": "application/json" },
@@ -279,24 +287,22 @@ async function streamTTSbyElevenLabs(text, ws, streamSid) {
     timeout:      15000,
   });
 
-  const pcmBuf = Buffer.from(res.data);
-  console.log(`[TTS/EL] ✅ ${pcmBuf.length}B pcm16k — converting`);
+  const audioBuf = Buffer.from(res.data);
+  console.log(`[TTS/EL] ✅ ${audioBuf.length}B mp3 — converting`);
 
   await new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", [
       "-hide_banner", "-loglevel", "error",
-      "-f",  "s16le",    // raw signed 16-bit little-endian PCM
-      "-ar", "16000",    // ElevenLabs pcm_16000 = 16kHz
-      "-ac", "1",
+      "-f",  "mp3",      // mp3 container — ffmpeg detects sample rate from header
       "-i",  "pipe:0",
-      "-ar", "8000",     // resample to 8kHz for mulaw
+      "-ar", "8000",
       "-ac", "1",
       "-acodec", "pcm_mulaw",
       "-f",      "mulaw",
       "pipe:1",
     ]);
     const sendP = streamMulawFromFFmpeg(ff, ws, streamSid);
-    Readable.from(pcmBuf).pipe(ff.stdin);
+    Readable.from(audioBuf).pipe(ff.stdin);
     ff.stdin.on("error", () => {});
     sendP.then(resolve).catch(reject);
   });
