@@ -183,7 +183,7 @@ async function streamTTSbyCamb(text, ws, streamSid) {
       "https://client.camb.ai/apis/tts-stream",
       {
         text:           text,
-        language:       "english",
+        language:       "en-in",
         voice_id:       voiceId,
         speech_model:   "mars-flash",
         voice_settings: { speaking_rate: 1.05 },
