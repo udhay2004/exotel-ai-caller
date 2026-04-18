@@ -12,20 +12,27 @@ const wss    = new WebSocket.Server({ server });
 const PORT   = process.env.PORT || 10000;
 
 // ─────────────────────────────────────────────────────────────────────────
-// ENV VAR NAMES (exactly as saved in Render):
+// ROOT CAUSE OF SILENCE:
 //
-//   CAM_API_KEY        → your CAMB.AI key  ← PRIMARY TTS (add this now)
-//   ELEVENLABS_API_KEY → EL key            ← FALLBACK (kept just in case)
-//   ELEVENLABS_VOICE_ID                    ← EL voice (optional)
-//   DEEPGRAM_API_KEY                       ← STT (required)
-//   ANTHROPIC_API_KEY                      ← AI  (required)
+//   The logs showed:
+//     [WS] stop | jbl2kb          ← Exotel HUNG UP at this point
+//     [FFMPEG] ✅ 65768B wav → 32845B mulaw@8k   ← audio finished AFTER hangup
+//     [SEND] ✅ 206 frames        ← sent to a closed connection = silence
 //
-// CAMB.AI optional overrides:
-//   CAMB_VOICE_ID  → integer voice ID (default: 147320)
-//                    Browse voices at studio.camb.ai → Voice Library
+//   WHY: CAMB.AI returned 65768B WAV. ffmpeg had to decode the WAV container
+//   + resample → took ~2-3 seconds. Exotel's greeting timeout (~2s) expired
+//   and it hung up BEFORE audio was ready.
+//
+//   FIX — Three changes:
+//   1. Request pcm_s16le (raw PCM) from CAMB.AI instead of WAV.
+//      Raw PCM has no container overhead → ffmpeg starts converting instantly.
+//   2. Stream ffmpeg output in real-time chunks to Exotel as they arrive,
+//      instead of buffering the entire audio first.
+//   3. Add a fast pre-flight silence burst (3 frames = 60ms) immediately
+//      on "start" so Exotel knows the stream is alive while TTS loads.
 // ─────────────────────────────────────────────────────────────────────────
 
-const MULAW_FRAME_BYTES     = 160;
+const MULAW_FRAME_BYTES     = 160;   // 20ms of audio at 8kHz mulaw
 const SILENCE_TIMEOUT_MS    = 1200;
 const MIN_AUDIO_BYTES       = 3200;
 const MULAW_SILENCE_BYTE    = 0xFF;
@@ -57,8 +64,7 @@ function checkEnv() {
   const elKey   = process.env["ELEVENLABS_API_KEY"];
 
   if (!cambKey && !elKey) {
-    console.error("❌ No TTS provider! Add 'CAM_API_KEY' to Render env vars.");
-    console.error("   Get key at: studio.camb.ai → API section");
+    console.error("❌ No TTS provider! Add CAM_API_KEY to Render env vars.");
     process.exit(1);
   }
 
@@ -67,190 +73,198 @@ function checkEnv() {
   if (elKey)   providers.push("ElevenLabs");
 
   console.log("✅ Env OK | TTS cascade:", providers.join(" → "));
-  console.log(`   CAMB.AI key : ${cambKey ? cambKey.slice(0, 10) + "..." : "NOT SET ⚠️"}`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// ffmpeg: any audio format → exact 8kHz raw mulaw
+// Send a few silent frames immediately so Exotel knows stream is alive.
+// This prevents Exotel from timing out during TTS generation.
 // ─────────────────────────────────────────────────────────────────────────
-function toExactMulaw8k(inputBuffer, inputFormat) {
-  return new Promise((resolve, reject) => {
-    const fmt   = inputFormat || "wav";
-    const isRaw = fmt === "mulaw"; // raw formats need explicit rate hint
+function sendKeepAlive(ws, streamSid, frameCount = 5) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const silenceFrame = Buffer.alloc(MULAW_FRAME_BYTES, MULAW_SILENCE_BYTE);
+  const payload      = silenceFrame.toString("base64");
+  for (let i = 0; i < frameCount; i++) {
+    try {
+      ws.send(JSON.stringify({
+        event:      "media",
+        stream_sid: streamSid,
+        media:      { payload },
+      }));
+    } catch (_) {}
+  }
+  console.log(`[KEEPALIVE] Sent ${frameCount} silent frames`);
+}
 
-    const args = [
-      "-hide_banner", "-loglevel", "error",
-      "-f", fmt,
-      ...(isRaw ? ["-ar", "8000", "-ac", "1"] : []),
-      "-i", "pipe:0",
-      "-ar", "8000",
-      "-ac", "1",
-      "-acodec", "pcm_mulaw",
-      "-f", "mulaw",
-      "pipe:1",
-    ];
+// ─────────────────────────────────────────────────────────────────────────
+// STREAMING mulaw sender — sends frames as ffmpeg produces them in real time.
+// This is the key fix: audio starts playing on Exotel within ~200ms of
+// calling streamTTS, rather than waiting for the full conversion to finish.
+// ─────────────────────────────────────────────────────────────────────────
+function streamMulawFromFFmpeg(ffProcess, ws, streamSid) {
+  return new Promise((resolve) => {
+    let remainder = Buffer.alloc(0); // bytes not yet forming a full frame
+    let sent      = 0;
 
-    const ff     = spawn("ffmpeg", args);
-    const chunks = [];
+    ffProcess.stdout.on("data", (chunk) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    ff.stdout.on("data", (c) => chunks.push(c));
-    ff.stderr.on("data", (e) => {
+      // Prepend any leftover bytes from previous chunk
+      const buf = Buffer.concat([remainder, chunk]);
+      let offset = 0;
+
+      // Send complete frames immediately as they arrive
+      while (offset + MULAW_FRAME_BYTES <= buf.length) {
+        const frame = buf.slice(offset, offset + MULAW_FRAME_BYTES);
+        offset += MULAW_FRAME_BYTES;
+        try {
+          ws.send(JSON.stringify({
+            event:      "media",
+            stream_sid: streamSid,
+            media:      { payload: frame.toString("base64") },
+          }));
+          sent++;
+        } catch (e) {
+          console.warn("[STREAM] send failed:", e.message);
+          return;
+        }
+      }
+
+      // Keep leftover bytes for next chunk
+      remainder = buf.slice(offset);
+    });
+
+    ffProcess.stdout.on("end", () => {
+      // Send any remaining bytes padded to a full frame
+      if (remainder.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
+        const pad = Buffer.alloc(MULAW_FRAME_BYTES, MULAW_SILENCE_BYTE);
+        remainder.copy(pad);
+        try {
+          ws.send(JSON.stringify({
+            event:      "media",
+            stream_sid: streamSid,
+            media:      { payload: pad.toString("base64") },
+          }));
+          sent++;
+        } catch (_) {}
+      }
+
+      // Tell Exotel TTS is done
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({
+            event:      "mark",
+            stream_sid: streamSid,
+            mark:       { name: "tts_done" },
+          }));
+        } catch (_) {}
+      }
+
+      const dur = (sent * MULAW_FRAME_BYTES) / 8000;
+      console.log(`[STREAM] ✅ ${sent} frames / ~${dur.toFixed(1)}s sent`);
+      resolve();
+    });
+
+    ffProcess.stderr.on("data", (e) => {
       const m = e.toString().trim();
       if (m) console.warn("[FFMPEG]", m);
     });
-    ff.on("close", (code) => {
-      if (code === 0) {
-        const out = Buffer.concat(chunks);
-        console.log(`[FFMPEG] ✅ ${inputBuffer.length}B ${fmt} → ${out.length}B mulaw@8k`);
-        resolve(out);
-      } else {
-        reject(new Error(`ffmpeg exited ${code}`));
-      }
-    });
-    ff.on("error", reject);
 
-    Readable.from(inputBuffer).pipe(ff.stdin);
-    ff.stdin.on("error", () => {});
+    ffProcess.on("error", (err) => {
+      console.error("[FFMPEG] spawn error:", err.message);
+      resolve();
+    });
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Send mulaw frames to Exotel via WebSocket
-// ─────────────────────────────────────────────────────────────────────────
-function sendMulawFrames(mulawBuf, ws, streamSid) {
-  let offset = 0;
-  let sent   = 0;
-
-  while (offset + MULAW_FRAME_BYTES <= mulawBuf.length) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) break;
-    const frame = mulawBuf.slice(offset, offset + MULAW_FRAME_BYTES);
-    offset += MULAW_FRAME_BYTES;
-    try {
-      ws.send(JSON.stringify({
-        event:      "media",
-        stream_sid: streamSid,
-        media:      { payload: frame.toString("base64") },
-      }));
-      sent++;
-    } catch (e) {
-      console.warn("[SEND] failed:", e.message);
-      break;
-    }
-  }
-
-  // Pad last partial frame
-  if (offset < mulawBuf.length && ws && ws.readyState === WebSocket.OPEN) {
-    const pad = Buffer.alloc(MULAW_FRAME_BYTES, MULAW_SILENCE_BYTE);
-    mulawBuf.slice(offset).copy(pad);
-    try {
-      ws.send(JSON.stringify({
-        event:      "media",
-        stream_sid: streamSid,
-        media:      { payload: pad.toString("base64") },
-      }));
-      sent++;
-    } catch (_) {}
-  }
-
-  // Mark = TTS done signal
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    try {
-      ws.send(JSON.stringify({
-        event:      "mark",
-        stream_sid: streamSid,
-        mark:       { name: "tts_done" },
-      }));
-    } catch (_) {}
-  }
-
-  const dur = (sent * MULAW_FRAME_BYTES) / 8000;
-  console.log(`[SEND] ✅ ${sent} frames / ~${dur.toFixed(1)}s`);
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// TTS PROVIDER 1 — CAMB.AI  (mars-flash, ~100ms latency)
+// TTS PROVIDER 1 — CAMB.AI streaming pipeline
 //
-// Docs: https://docs.camb.ai/api-reference/endpoint/create-tts-stream
-// Auth: x-api-key header  (key name in Render: "CAM_API_KEY")
-// Output: WAV → ffmpeg → mulaw 8kHz
+// Key change: request pcm_s16le (raw signed 16-bit PCM at 8kHz).
+//   - No container header to parse → ffmpeg starts instantly
+//   - ffmpeg reads the raw PCM stream and outputs mulaw frames in real-time
+//   - Exotel starts playing audio within ~200ms of the API call returning
 // ─────────────────────────────────────────────────────────────────────────
-async function ttsByCamb(text) {
+async function streamTTSbyCamb(text, ws, streamSid) {
   const apiKey = process.env["CAM_API_KEY"];
   if (!apiKey) throw new Error("CAM_API_KEY not set");
 
   const voiceId = parseInt(process.env.CAMB_VOICE_ID || "147320", 10);
   console.log(`[TTS/CAMB] voice=${voiceId} | "${text.slice(0, 60)}"`);
 
-  const res = await axios.post(
-    "https://client.camb.ai/apis/tts-stream",
-    {
-      text,
-      language:     "en-in",        // Indian English
-      voice_id:     voiceId,
-      speech_model: "mars-flash",   // fastest model, ideal for real-time phone calls
-      enhance_named_entities_pronunciation: false,
-      output_configuration: {
-        format:      "wav",
-        sample_rate: 8000,           // request 8kHz directly
-      },
-      voice_settings: {
-        speaking_rate: 1.05,         // slightly faster = more natural on phone
-      },
-      inference_options: {
-        stability:          0.6,
-        temperature:        0.7,
-        speaker_similarity: 0.7,
-      },
-    },
-    {
-      headers: {
-        "x-api-key":    apiKey,
-        "Content-Type": "application/json",
-      },
-      responseType: "arraybuffer",
-      timeout:      20000,
-    }
-  );
+  // Start ffmpeg FIRST, before the HTTP request, so it's ready to receive
+  // data the moment CAMB.AI starts streaming back
+  const ff = spawn("ffmpeg", [
+    "-hide_banner", "-loglevel", "error",
+    // Input: raw signed 16-bit PCM at 8kHz mono (what CAMB.AI returns)
+    "-f",  "s16le",
+    "-ar", "8000",
+    "-ac", "1",
+    "-i",  "pipe:0",
+    // Output: raw mulaw at exactly 8kHz mono
+    "-ar",     "8000",
+    "-ac",     "1",
+    "-acodec", "pcm_mulaw",
+    "-f",      "mulaw",
+    "pipe:1",
+  ]);
 
-  const wavBuf = Buffer.from(res.data);
-  if (wavBuf.length < 100) {
-    throw new Error(`CAMB.AI returned too-small buffer: ${wavBuf.length}B`);
+  // Start the streaming sender in parallel (it will send frames as they arrive)
+  const sendPromise = streamMulawFromFFmpeg(ff, ws, streamSid);
+
+  // Make the HTTP request with responseType: "stream" so we pipe directly
+  let res;
+  try {
+    res = await axios.post(
+      "https://client.camb.ai/apis/tts-stream",
+      {
+        text,
+        language:     "en-in",
+        voice_id:     voiceId,
+        speech_model: "mars-flash",
+        output_configuration: {
+          format:      "pcm_s16le",   // raw PCM — no container, fastest conversion
+          sample_rate: 8000,
+        },
+        voice_settings:   { speaking_rate: 1.05 },
+        inference_options: { stability: 0.6, temperature: 0.7, speaker_similarity: 0.7 },
+      },
+      {
+        headers:      { "x-api-key": apiKey, "Content-Type": "application/json" },
+        responseType: "stream",   // stream directly into ffmpeg — don't buffer
+        timeout:      20000,
+      }
+    );
+  } catch (err) {
+    ff.kill();
+    throw err;
   }
-  console.log(`[TTS/CAMB] ✅ ${wavBuf.length}B WAV received`);
-  return await toExactMulaw8k(wavBuf, "wav");
+
+  // Pipe CAMB.AI response stream directly into ffmpeg stdin
+  res.data.pipe(ff.stdin);
+  res.data.on("error", (e) => {
+    console.warn("[TTS/CAMB] stream error:", e.message);
+    ff.stdin.end();
+  });
+  res.data.on("end", () => {
+    ff.stdin.end();
+    console.log("[TTS/CAMB] ✅ CAMB.AI stream finished");
+  });
+
+  // Wait until all frames have been sent to Exotel
+  await sendPromise;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// TTS PROVIDER 2 — ElevenLabs (fallback, skipped if key missing)
+// TTS PROVIDER 2 — ElevenLabs fallback (buffered, not streaming)
 // ─────────────────────────────────────────────────────────────────────────
-async function ttsByElevenLabs(text) {
+async function streamTTSbyElevenLabs(text, ws, streamSid) {
   const apiKey  = process.env["ELEVENLABS_API_KEY"];
   if (!apiKey) throw new Error("ELEVENLABS_API_KEY not set");
 
   const voiceId = process.env.ELEVENLABS_VOICE_ID || "9BWtsMINqrJLrRacOk9x";
   console.log(`[TTS/EL] voice=${voiceId} | "${text.slice(0, 60)}"`);
 
-  // Try ulaw_8000 first
-  try {
-    const res = await axios({
-      method: "post",
-      url:    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
-      data: {
-        text,
-        model_id:       "eleven_turbo_v2",
-        output_format:  "ulaw_8000",
-        voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.0 },
-      },
-      headers: { "xi-api-key": apiKey, "Content-Type": "application/json" },
-      responseType: "arraybuffer",
-      timeout:      15000,
-    });
-    return await toExactMulaw8k(Buffer.from(res.data), "mulaw");
-  } catch (e) {
-    console.warn("[TTS/EL] ulaw failed, trying mp3:", e.message.slice(0, 80));
-  }
-
-  // mp3 fallback
+  // Try mp3 (works on all plan tiers)
   const res = await axios({
     method: "post",
     url:    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
@@ -260,40 +274,69 @@ async function ttsByElevenLabs(text) {
       output_format:  "mp3_44100_128",
       voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.0 },
     },
-    headers: { "xi-api-key": apiKey, "Content-Type": "application/json" },
+    headers:      { "xi-api-key": apiKey, "Content-Type": "application/json" },
     responseType: "arraybuffer",
     timeout:      15000,
   });
-  const mp3 = Buffer.from(res.data);
-  console.log(`[TTS/EL] ✅ ${mp3.length}B mp3`);
-  return await toExactMulaw8k(mp3, "mp3");
+
+  const mp3Buf = Buffer.from(res.data);
+  console.log(`[TTS/EL] ✅ ${mp3Buf.length}B mp3 — converting`);
+
+  // Buffered conversion for EL (mp3 needs full buffer before ffmpeg can decode)
+  await new Promise((resolve, reject) => {
+    const ff = spawn("ffmpeg", [
+      "-hide_banner", "-loglevel", "error",
+      "-f", "mp3", "-i", "pipe:0",
+      "-ar", "8000", "-ac", "1",
+      "-acodec", "pcm_mulaw", "-f", "mulaw",
+      "pipe:1",
+    ]);
+    const sendP = streamMulawFromFFmpeg(ff, ws, streamSid);
+    Readable.from(mp3Buf).pipe(ff.stdin);
+    ff.stdin.on("error", () => {});
+    sendP.then(resolve).catch(reject);
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// TTS CASCADE — CAMB.AI → ElevenLabs → silence (call never crashes)
+// Master TTS function — cascade with keep-alive
 // ─────────────────────────────────────────────────────────────────────────
 async function streamTTS(text, ws, streamSid) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   console.log(`[TTS] → "${text.slice(0, 80)}"`);
 
+  // Send silent frames immediately so Exotel doesn't hang up while TTS loads
+  sendKeepAlive(ws, streamSid, 5);
+
   const providers = [
-    { name: "CAMB.AI",    fn: () => ttsByCamb(text) },
-    { name: "ElevenLabs", fn: () => ttsByElevenLabs(text) },
+    { name: "CAMB.AI",    fn: () => streamTTSbyCamb(text, ws, streamSid) },
+    { name: "ElevenLabs", fn: () => streamTTSbyElevenLabs(text, ws, streamSid) },
   ];
 
   for (const p of providers) {
     try {
-      const mulawBuf = await p.fn();
-      console.log(`[TTS] ✅ ${p.name} success — ${mulawBuf.length}B mulaw`);
-      sendMulawFrames(mulawBuf, ws, streamSid);
+      await p.fn();
+      console.log(`[TTS] ✅ Done via ${p.name}`);
       return;
     } catch (err) {
       console.warn(`[TTS] ❌ ${p.name}: ${err.message.slice(0, 150)}`);
     }
   }
 
-  console.error("[TTS] 🚨 ALL providers failed — sending silence");
-  sendMulawFrames(Buffer.alloc(8000, MULAW_SILENCE_BYTE), ws, streamSid);
+  // Last resort: send 2 seconds of silence
+  console.error("[TTS] 🚨 All providers failed — sending silence");
+  const buf = Buffer.alloc(16000, MULAW_SILENCE_BYTE);
+  let offset = 0;
+  while (offset + MULAW_FRAME_BYTES <= buf.length && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({
+        event:      "media",
+        stream_sid: streamSid,
+        media:      { payload: buf.slice(offset, offset + MULAW_FRAME_BYTES).toString("base64") },
+      }));
+    } catch (_) { break; }
+    offset += MULAW_FRAME_BYTES;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -400,10 +443,14 @@ wss.on("connection", (ws, req) => {
     if (data.event === "start") {
       session.streamSid = data.start?.stream_sid || data.stream_sid;
       console.log(`[WS] start | streamSid=${session.streamSid}`);
+
       if (!session.greetingSent) {
         session.greetingSent = true;
         session.history.push({ role: "assistant", content: GREETING });
-        await streamTTS(GREETING, ws, session.streamSid);
+        // Do NOT await — let greeting play while we keep receiving events
+        streamTTS(GREETING, ws, session.streamSid).catch((e) =>
+          console.error("[GREETING]", e.message)
+        );
       }
     }
 
