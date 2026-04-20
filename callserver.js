@@ -434,11 +434,15 @@ wss.on("connection", (ws, req) => {
     history:         [],
     streamSid:       null,
     audioChunks:     [],      // chunks accumulating before current speech ends
-    pendingChunks:   [],      // FIX #4: audio buffered while isProcessing
+    pendingChunks:   [],      // audio buffered while isProcessing
     isProcessing:    false,
     greetingSent:    false,
     silenceTimer:    null,
     wsOpen:          true,
+    // ── diagnostics ──────────────────────────────────────────────────────
+    mediaPacketCount:   0,    // total media packets received from Exotel
+    mediaByteCount:     0,    // total decoded bytes received
+    lastMediaAt:        null, // timestamp of last media packet
   };
   sessions.set(callId, session);
 
@@ -511,8 +515,26 @@ wss.on("connection", (ws, req) => {
     // ── media ───────────────────────────────────────────────────────────────
     if (data.event === "media") {
       const rawBytes = Buffer.from(data.media.payload, "base64");
+      session.mediaPacketCount++;
+      session.mediaByteCount += rawBytes.length;
+      session.lastMediaAt = Date.now();
 
-      // FIX #4: If currently processing, buffer audio — do NOT drop it.
+      // ── DIAGNOSTIC: log every 10th packet so we can confirm Exotel is
+      //    actually sending caller audio back to us.
+      if (session.mediaPacketCount <= 5 || session.mediaPacketCount % 10 === 0) {
+        // Peek at first 4 bytes to help identify encoding
+        const hex4 = rawBytes.slice(0, 4).toString("hex");
+        const sampleEnergy = pcmEnergy(rawBytes);
+        console.log(
+          `[MEDIA] pkt#${session.mediaPacketCount} ` +
+          `${rawBytes.length}B ` +
+          `hex0-4=[${hex4}] ` +
+          `energy=${sampleEnergy.toFixed(0)} ` +
+          `isProcessing=${session.isProcessing}`
+        );
+      }
+
+      // Buffer while processing — do NOT drop caller audio
       if (session.isProcessing) {
         session.pendingChunks.push(rawBytes);
         return;
@@ -520,36 +542,49 @@ wss.on("connection", (ws, req) => {
 
       session.audioChunks.push(rawBytes);
 
-      // FIX #6: Always reset silence timer on every packet.
+      // Reset silence timer on every packet
       clearTimeout(session.silenceTimer);
       session.silenceTimer = setTimeout(async () => {
-        if (session.isProcessing) return; // safety guard
+        if (session.isProcessing) return;
 
         const audio = Buffer.concat(session.audioChunks);
         session.audioChunks = [];
 
+        console.log(`[VAD] Timer fired — totalPkts=${session.mediaPacketCount} audio=${audio.length}B`);
+
         if (audio.length < MIN_AUDIO_BYTES) {
-          console.log(`[VAD] Too short (${audio.length}B) — skipped`);
+          console.log(`[VAD] Too short (${audio.length}B < ${MIN_AUDIO_BYTES}B) — skipped`);
           return;
         }
 
         const energy = pcmEnergy(audio);
-        console.log(`[VAD] energy=${energy.toFixed(0)} len=${audio.length}B thresh=${SILENCE_ENERGY_THRESH}`);
+        console.log(`[VAD] energy=${energy.toFixed(0)} thresh=${SILENCE_ENERGY_THRESH} len=${audio.length}B`);
 
         if (energy < SILENCE_ENERGY_THRESH) {
-          console.log("[VAD] Silence — skipped");
+          console.log("[VAD] Below threshold — silence, skipping");
           return;
         }
 
-        console.log("[VAD] Speech detected — processing utterance");
+        console.log("[VAD] ✓ Speech detected — processing utterance");
         await processUtterance(audio);
       }, SILENCE_TIMEOUT_MS);
     }
 
     // ── stop ────────────────────────────────────────────────────────────────
     if (data.event === "stop") {
-      console.log(`[WS] stop | ${callId}`);
       clearTimeout(session.silenceTimer);
+      console.log(
+        `[WS] stop | ${callId} | ` +
+        `mediaPackets=${session.mediaPacketCount} ` +
+        `mediaBytes=${session.mediaByteCount} ` +
+        `lastMediaAt=${session.lastMediaAt ? new Date(session.lastMediaAt).toISOString() : "never"}`
+      );
+      // If we got 0 media packets from Exotel, caller audio was never forwarded.
+      if (session.mediaPacketCount === 0) {
+        console.warn("[WS] ⚠ ZERO media packets received from Exotel — caller audio not forwarded.");
+        console.warn("[WS] ⚠ Likely causes: (1) KYC/free trial restriction, (2) Voicebot applet misconfigured,");
+        console.warn("[WS] ⚠ (3) Exotel's bidirectional streaming not enabled for this account/number.");
+      }
     }
 
     // ── mark ────────────────────────────────────────────────────────────────
@@ -562,7 +597,10 @@ wss.on("connection", (ws, req) => {
   ws.on("close", (code) => {
     session.wsOpen = false;
     clearTimeout(session.silenceTimer);
-    console.log(`[WS] closed | ${callId} | code=${code}`);
+    console.log(
+      `[WS] closed | ${callId} | code=${code} | ` +
+      `mediaPackets=${session.mediaPacketCount} mediaBytes=${session.mediaByteCount}`
+    );
     sessions.delete(callId);
   });
 
