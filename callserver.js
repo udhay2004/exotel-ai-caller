@@ -40,15 +40,15 @@ const PCM_SAMPLE_RATE    = 8000;
 const PCM_BYTES_PER_SAMPLE = 2;       // s16le = 2 bytes per sample
 const FRAME_MS           = 20;        // 20ms per frame
 const FRAME_BYTES        = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * FRAME_MS / 1000; // 320 bytes
-const SILENCE_TIMEOUT_MS = 1200;
-const MIN_AUDIO_BYTES    = 3200;      // Exotel minimum chunk = 100ms
+const SILENCE_TIMEOUT_MS = 800;
+const MIN_AUDIO_BYTES    = 1600;      // catch short words like yes/no
 const KEEPALIVE_INTERVAL_MS    = 200;
 const KEEPALIVE_FRAMES_PER_BURST = 10; // 10 × 20ms = 200ms of silence per burst
 
 // s16le silence is 0x00 bytes (PCM zero = silence, unlike mulaw 0xFF)
 const PCM_SILENCE_BYTE = 0x00;
 
-const SILENCE_ENERGY_THRESH = 500;   // PCM energy threshold (higher than mulaw)
+const SILENCE_ENERGY_THRESH = 150;   // lowered: catches short phone speech like "yes"
 
 const COMPANY_CONTEXT =
   "You are a professional telecaller from Connect Ventures. " +
@@ -235,21 +235,38 @@ function convertAndStream(audioBuf, ws, streamSid, fmt, stopKeepalive) {
 }
 
 // ---------------------------------------------------------------------------
-// TTS: CAMB.AI
+// TTS: CAMB.AI  — streaming pipeline for lowest latency
+// CAMB.AI returns an MP3 stream. We pipe it directly into ffmpeg stdin as it
+// arrives, so ffmpeg starts converting and we start sending PCM frames to
+// Exotel before the full MP3 has even downloaded. This cuts ~1.5s of latency.
 // ---------------------------------------------------------------------------
 async function streamTTSbyCamb(text, ws, streamSid, stopKeepalive) {
   const apiKey = process.env.CAM_API_KEY;
   if (!apiKey) throw new Error("CAM_API_KEY not set");
 
   const voiceId = parseInt(process.env.CAMB_VOICE_ID || "147320", 10);
-  console.log("[TTS/CAMB] Fetching: " + text.slice(0, 60));
+  console.log("[TTS/CAMB] Fetching (streaming): " + text.slice(0, 60));
 
+  // Spawn ffmpeg first — it will start converting the moment data flows in.
+  // CAMB.AI returns MP3, so input format is mp3.
+  const ff = spawn("ffmpeg", [
+    "-hide_banner", "-loglevel", "error",
+    "-f", "mp3", "-i", "pipe:0",
+    "-ar", String(PCM_SAMPLE_RATE), "-ac", "1",
+    "-f", "s16le", "pipe:1",
+  ]);
+
+  // Start the sender — it waits for ffmpeg stdout data
+  const sendPromise = streamPCMFromFFmpeg(ff, ws, streamSid, stopKeepalive);
+
+  // Now make the HTTP request with responseType "stream" so axios gives us
+  // a Node.js Readable we can pipe directly into ffmpeg stdin
   let res;
   try {
     res = await axios.post(
       "https://client.camb.ai/apis/tts-stream",
       {
-        text:           text,
+        text,
         language:       "en-in",
         voice_id:       voiceId,
         speech_model:   "mars-flash",
@@ -257,34 +274,27 @@ async function streamTTSbyCamb(text, ws, streamSid, stopKeepalive) {
       },
       {
         headers:      { "x-api-key": apiKey, "Content-Type": "application/json" },
-        responseType: "arraybuffer",
+        responseType: "stream",   // stream directly into ffmpeg — no buffering
         timeout:      20000,
       }
     );
   } catch (err) {
+    ff.kill();
+    // For stream responseType, err.response.data is a stream — read it for logging
     if (err.response) {
-      const body = Buffer.isBuffer(err.response.data)
-        ? err.response.data.toString("utf8").slice(0, 400)
-        : String(err.response.data).slice(0, 400);
-      console.error("[TTS/CAMB] HTTP " + err.response.status + ": " + body);
+      console.error("[TTS/CAMB] HTTP " + err.response.status);
     } else {
       console.error("[TTS/CAMB] Error: " + err.message);
     }
     throw err;
   }
 
-  const audioBuf = Buffer.from(res.data);
-  console.log("[TTS/CAMB] Received " + audioBuf.length + "B");
+  // Pipe CAMB.AI HTTP response directly into ffmpeg stdin as it arrives
+  res.data.pipe(ff.stdin);
+  res.data.on("error", (e) => { console.warn("[TTS/CAMB] stream err:", e.message); ff.stdin.end(); });
+  res.data.on("end", () => { ff.stdin.end(); console.log("[TTS/CAMB] stream complete"); });
 
-  if (audioBuf.length < 100) throw new Error("Too small: " + audioBuf.length + "B");
-
-  const magic = audioBuf.slice(0, 4).toString("ascii");
-  const isWav = magic === "RIFF";
-  const isMp3 = (audioBuf[0] === 0xFF && (audioBuf[1] & 0xE0) === 0xE0) || magic.startsWith("ID3");
-  const fmt   = isWav ? "wav" : isMp3 ? "mp3" : "wav";
-  console.log("[TTS/CAMB] Format: " + fmt);
-
-  await convertAndStream(audioBuf, ws, streamSid, fmt, stopKeepalive);
+  await sendPromise;
 }
 
 // ---------------------------------------------------------------------------
