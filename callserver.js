@@ -306,9 +306,10 @@ async function streamTTSbyElevenLabs(text, ws, streamSid, stopKeepalive) {
 // ---------------------------------------------------------------------------
 // Master TTS
 // ---------------------------------------------------------------------------
-async function streamTTS(text, ws, streamSid) {
+async function streamTTS(text, ws, streamSid, session) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   console.log("[TTS] ->", text.slice(0, 80));
+  if (session) session.isSpeaking = true;
 
   var stopKeepalive = startKeepalive(ws, streamSid);
 
@@ -323,6 +324,7 @@ async function streamTTS(text, ws, streamSid) {
     try {
       await p.fn();
       console.log("[TTS] Done via", p.name);
+      if (session) session.isSpeaking = false;
       return;
     } catch (err) {
       console.warn("[TTS] FAILED " + p.name + ":", err.message.slice(0, 200));
@@ -331,6 +333,7 @@ async function streamTTS(text, ws, streamSid) {
 
   stopKeepalive();
   console.error("[TTS] All providers failed");
+  if (session) session.isSpeaking = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,12 +367,43 @@ function amplifyPCM(buf, gain) {
 }
 
 // ---------------------------------------------------------------------------
+// Trim silence from PCM buffer — only keep frames around speech energy.
+// Prevents sending 34s of background noise to Deepgram when caller spoke
+// for only 2s. Works on FRAME_BYTES (320B) chunks.
+// ---------------------------------------------------------------------------
+function trimSpeechPCM(buf, energyThresh) {
+  var frames = [];
+  for (var i = 0; i + FRAME_BYTES <= buf.length; i += FRAME_BYTES) {
+    frames.push(buf.slice(i, i + FRAME_BYTES));
+  }
+  // Find first and last frame above threshold
+  var first = -1, last = -1;
+  for (var f = 0; f < frames.length; f++) {
+    if (pcmEnergy(frames[f]) >= energyThresh) {
+      if (first === -1) first = f;
+      last = f;
+    }
+  }
+  if (first === -1) return buf; // no speech found — return as-is
+  // Add 10-frame (200ms) padding each side
+  var padFrames = 10;
+  first = Math.max(0, first - padFrames);
+  last  = Math.min(frames.length - 1, last + padFrames);
+  var trimmed = Buffer.concat(frames.slice(first, last + 1));
+  console.log("[TRIM] " + frames.length + " frames -> " + (last - first + 1) +
+    " frames (kept frames " + first + "-" + last + ")");
+  return trimmed;
+}
+
+// ---------------------------------------------------------------------------
 // STT: Deepgram nova-2 (raw s16le linear16 @ 8kHz)
 // ---------------------------------------------------------------------------
 async function speechToText(rawBuffer) {
+  // Trim silence — only keep the actual speech window before amplifying
+  var trimmed    = trimSpeechPCM(rawBuffer, SILENCE_ENERGY_THRESH);
   // Amplify before STT — Exotel audio is extremely quiet
-  var amplified  = amplifyPCM(rawBuffer, PCM_AMPLIFY);
-  var preEnergy  = pcmEnergy(rawBuffer).toFixed(0);
+  var amplified  = amplifyPCM(trimmed, PCM_AMPLIFY);
+  var preEnergy  = pcmEnergy(trimmed).toFixed(0);
   var postEnergy = pcmEnergy(amplified).toFixed(0);
   console.log("[STT] " + amplified.length + "B | energy raw=" +
     preEnergy + " amplified=" + postEnergy + " (gain=" + PCM_AMPLIFY + "x)");
@@ -449,7 +483,8 @@ wss.on("connection", function(ws, req) {
     streamSid:        null,
     audioChunks:      [],
     pendingChunks:    [],    // audio received while isProcessing — never dropped
-    isProcessing:     false,
+    isProcessing:     false,  // true while STT/LLM running
+    isSpeaking:       false,  // true while TTS audio is playing to caller
     greetingSent:     false,
     silenceTimer:     null,
     wsOpen:           true,
@@ -469,7 +504,7 @@ wss.on("connection", function(ws, req) {
       if (transcript && transcript.trim().length > 2) {
         var reply = await getAIResponse(session.history, transcript);
         if (session.wsOpen && ws.readyState === WebSocket.OPEN) {
-          await streamTTS(reply, ws, session.streamSid);
+          await streamTTS(reply, ws, session.streamSid, session);
         }
       } else {
         console.log("[UTT] Empty/short transcript — skipping");
@@ -516,7 +551,7 @@ wss.on("connection", function(ws, req) {
       if (!session.greetingSent) {
         session.greetingSent = true;
         session.history.push({ role: "assistant", content: GREETING });
-        streamTTS(GREETING, ws, session.streamSid).catch(function(e) {
+        streamTTS(GREETING, ws, session.streamSid, session).catch(function(e) {
           console.error("[GREETING]", e.message);
         });
       }
@@ -539,7 +574,12 @@ wss.on("connection", function(ws, req) {
           " processing=" + session.isProcessing);
       }
 
-      // Buffer — never drop caller audio while processing
+      // Discard audio while bot is speaking — it's just line noise/echo
+      if (session.isSpeaking) {
+        return;
+      }
+
+      // Buffer caller audio while STT/LLM is running — process after done
       if (session.isProcessing) {
         session.pendingChunks.push(rawBytes);
         return;
