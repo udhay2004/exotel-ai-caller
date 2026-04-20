@@ -29,7 +29,7 @@ const FRAME_BYTES           = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * FRAME_MS 
 
 // VAD: observed background noise = energy 9, speech peaks = energy ~170.
 // Threshold of 20 sits safely between them. Tune via ENERGY_THRESH env var.
-const SILENCE_TIMEOUT_MS    = 1800;
+const SILENCE_TIMEOUT_MS    = 600;   // Short: must fire before Exotel hangs up
 const SILENCE_ENERGY_THRESH = parseInt(process.env.ENERGY_THRESH || "20", 10);
 
 // Amplify incoming PCM before STT. Exotel sends ~+/-8 amplitude audio.
@@ -549,36 +549,14 @@ wss.on("connection", function(ws, req) {
 
       // Reset silence timer on every packet
       clearTimeout(session.silenceTimer);
-      session.silenceTimer = setTimeout(async function() {
-        if (session.isProcessing) return;
-
-        var audio = Buffer.concat(session.audioChunks);
-        session.audioChunks = [];
-
-        console.log("[VAD] Timer fired | totalPkts=" + session.mediaPacketCount +
-          " audio=" + audio.length + "B");
-
-        if (audio.length < MIN_AUDIO_BYTES) {
-          console.log("[VAD] Too short (" + audio.length + "B) — skipped");
-          return;
-        }
-
-        var energy = pcmEnergy(audio);
-        console.log("[VAD] energy=" + energy.toFixed(0) +
-          " thresh=" + SILENCE_ENERGY_THRESH +
-          " len=" + audio.length + "B");
-
-        if (energy < SILENCE_ENERGY_THRESH) {
-          console.log("[VAD] Below threshold — silence, skipping");
-          return;
-        }
-
-        console.log("[VAD] Speech detected — processing");
-        await processUtterance(audio);
+      session.silenceTimer = setTimeout(function() {
+        flushAudio("silence-timer");
       }, SILENCE_TIMEOUT_MS);
     }
 
-    // stop
+    // stop — flush buffered audio immediately; don't wait for silence timer.
+    // This is critical: Exotel ends the call before 600ms silence elapses,
+    // so the timer alone is not reliable. stop event guarantees one final flush.
     if (data.event === "stop") {
       clearTimeout(session.silenceTimer);
       console.log("[WS] stop | " + callId +
@@ -586,8 +564,37 @@ wss.on("connection", function(ws, req) {
         " mediaBytes=" + session.mediaByteCount +
         " lastMediaAt=" + (session.lastMediaAt ? new Date(session.lastMediaAt).toISOString() : "never"));
       if (session.mediaPacketCount === 0) {
-        console.warn("[WS] WARNING: ZERO media packets from Exotel — caller audio not forwarded");
+        console.warn("[WS] WARNING: ZERO media packets from Exotel");
       }
+      flushAudio("stop-event");
+    }
+
+    // flushAudio — evaluate buffered audio and run STT pipeline if speech found.
+    // Called from BOTH the silence timer and the stop event.
+    async function flushAudio(trigger) {
+      if (session.isProcessing) {
+        console.log("[VAD] flushAudio skipped (processing) trigger=" + trigger);
+        return;
+      }
+      if (session.audioChunks.length === 0) {
+        console.log("[VAD] flushAudio — no chunks trigger=" + trigger);
+        return;
+      }
+      var audio = Buffer.concat(session.audioChunks);
+      session.audioChunks = [];
+      console.log("[VAD] flushAudio trigger=" + trigger + " audio=" + audio.length + "B pkts=" + session.mediaPacketCount);
+      if (audio.length < MIN_AUDIO_BYTES) {
+        console.log("[VAD] Too short (" + audio.length + "B) — skipped");
+        return;
+      }
+      var energy = pcmEnergy(audio);
+      console.log("[VAD] energy=" + energy.toFixed(0) + " thresh=" + SILENCE_ENERGY_THRESH);
+      if (energy < SILENCE_ENERGY_THRESH) {
+        console.log("[VAD] Silence — skipping");
+        return;
+      }
+      console.log("[VAD] Speech via " + trigger + " — processing");
+      await processUtterance(audio);
     }
 
     // mark
