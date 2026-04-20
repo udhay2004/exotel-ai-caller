@@ -251,7 +251,7 @@ async function streamTTSbyCamb(text, ws, streamSid, stopKeepalive) {
   // CAMB.AI returns MP3, so input format is mp3.
   const ff = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "error",
-    "-f", "mp3", "-i", "pipe:0",
+    "-probesize", "32", "-analyzeduration", "0", "-f", "mp3", "-i", "pipe:0",
     "-ar", String(PCM_SAMPLE_RATE), "-ac", "1",
     "-f", "s16le", "pipe:1",
   ]);
@@ -455,13 +455,14 @@ wss.on("connection", function(ws, req) {
 
   const session = {
     callId,
-    history:      [],
-    streamSid:    null,
-    audioChunks:  [],
-    isProcessing: false,
-    greetingSent: false,
-    silenceTimer: null,
-    wsOpen:       true,
+    history:         [],
+    streamSid:       null,
+    audioChunks:     [],
+    isProcessing:    false,
+    greetingSent:    false,
+    firstMediaLogged:false,
+    silenceTimer:    null,
+    wsOpen:          true,
   };
   sessions.set(callId, session);
 
@@ -484,16 +485,39 @@ wss.on("connection", function(ws, req) {
       if (!session.greetingSent) {
         session.greetingSent = true;
         session.history.push({ role: "assistant", content: GREETING });
-        streamTTS(GREETING, ws, session.streamSid).catch(function(e) {
-          console.error("[GREETING]", e.message);
-        });
+        // Mark as processing during greeting so we don't try to process
+        // any echo/background noise while bot is speaking
+        session.isProcessing = true;
+        streamTTS(GREETING, ws, session.streamSid)
+          .then(function() {
+            // Greeting done — clear any audio collected during playback (echo)
+            // and open up for caller response
+            session.audioChunks = [];
+            session.isProcessing = false;
+            console.log("[SESSION] Greeting done — listening for caller");
+          })
+          .catch(function(e) {
+            session.isProcessing = false;
+            console.error("[GREETING]", e.message);
+          });
       }
     }
 
     if (data.event === "media") {
+      // Log first media frame details for diagnosis
+      if (!session.firstMediaLogged) {
+        session.firstMediaLogged = true;
+        const sample = Buffer.from(data.media.payload, "base64");
+        console.log("[MEDIA] First frame: " + sample.length + "B, chunk=" +
+          data.media.chunk + ", ts=" + data.media.timestamp +
+          ", first4bytes=" + sample.slice(0,4).toString("hex"));
+      }
+
+      // Don't collect audio while the bot is speaking — caller audio during
+      // bot speech is just echo/overlap, not a real turn.
+      // But DO collect after bot finishes (isProcessing=false).
       if (session.isProcessing) return;
 
-      // Exotel Voicebot sends raw s16le PCM base64
       const rawBytes = Buffer.from(data.media.payload, "base64");
       session.audioChunks.push(rawBytes);
 
@@ -509,16 +533,18 @@ wss.on("connection", function(ws, req) {
           return;
         }
         const energy = pcmEnergy(audio);
+        console.log("[VAD] energy=" + energy.toFixed(0) + " bytes=" + audio.length +
+          " thresh=" + SILENCE_ENERGY_THRESH);
         if (energy < SILENCE_ENERGY_THRESH) {
-          console.log("[VAD] Silence (energy=" + energy.toFixed(0) + ")");
+          console.log("[VAD] Below threshold — skipping");
           return;
         }
-        console.log("[VAD] Speech | energy=" + energy.toFixed(0) + " | " + audio.length + "B");
+        console.log("[VAD] Speech detected — sending to STT");
         session.isProcessing = true;
 
         try {
           const transcript = await speechToText(audio);
-          if (transcript && transcript.trim().length > 2) {
+          if (transcript && transcript.trim().length > 0) {
             const reply = await getAIResponse(session.history, transcript);
             if (session.wsOpen && ws.readyState === WebSocket.OPEN) {
               await streamTTS(reply, ws, session.streamSid);
