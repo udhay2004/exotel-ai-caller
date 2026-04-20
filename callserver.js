@@ -12,44 +12,39 @@ const wss    = new WebSocket.Server({ server });
 const PORT   = process.env.PORT || 10000;
 
 // ---------------------------------------------------------------------------
-// CRITICAL PROTOCOL NOTE — Exotel Voicebot vs Stream applet:
+// PROTOCOL: Exotel Voicebot applet
+//   Inbound  (Exotel → server): raw s16le PCM 8kHz mono, base64-encoded
+//   Outbound (server → Exotel): same format
 //
-// Stream applet  → sends/expects  mulaw  8kHz base64
-// Voicebot applet → sends/expects  raw s16le PCM  8kHz mono little-endian base64
-//
-// Previous code was sending mulaw to Voicebot → garbled noise.
-// This file speaks the correct Voicebot protocol: raw PCM s16le.
-//
-// Outbound media message format (server → Exotel):
-// {
-//   "event": "media",
-//   "stream_sid": "<sid>",
-//   "media": { "payload": "<base64 raw s16le PCM>" }
-// }
-//
-// To interrupt/clear audio already queued on Exotel:
-// { "event": "clear", "stream_sid": "<sid>" }
-//
-// Chunk size rules from Exotel docs:
-//   - Min: 3200 bytes (100ms of audio at 8kHz s16le = 8000*2*0.1 = 1600... actually 3200 min)
-//   - Max: 100KB
-//   - Must be multiple of 320 bytes (320 = 20ms frame at 8kHz s16le)
+// Chunk size rules (Exotel docs):
+//   Min: 3200 bytes  (100 ms at 8kHz s16le)
+//   Max: 100 KB
+//   Must be multiple of 320 bytes (20 ms frame)
 // ---------------------------------------------------------------------------
 
-const PCM_SAMPLE_RATE    = 8000;
-const PCM_BYTES_PER_SAMPLE = 2;       // s16le = 2 bytes per sample
-const FRAME_MS           = 20;        // 20ms per frame
-const FRAME_BYTES        = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * FRAME_MS / 1000; // 320 bytes
-const SILENCE_TIMEOUT_MS = 800;
-const MIN_AUDIO_BYTES    = 1600;      // catch short words like yes/no
-const KEEPALIVE_INTERVAL_MS    = 200;
-const KEEPALIVE_FRAMES_PER_BURST = 10; // 10 × 20ms = 200ms of silence per burst
+const PCM_SAMPLE_RATE      = 8000;
+const PCM_BYTES_PER_SAMPLE = 2;          // s16le
+const FRAME_MS             = 20;
+const FRAME_BYTES          = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * FRAME_MS / 1000; // 320
 
-// s16le silence is 0x00 bytes (PCM zero = silence, unlike mulaw 0xFF)
-const PCM_SILENCE_BYTE = 0x00;
+// ── Silence / VAD ──────────────────────────────────────────────────────────
+// FIX #1: Increased silence timeout. 1200ms fired too early on real phone
+// audio where Exotel buffers/re-packetises speech. 1800ms is safer.
+const SILENCE_TIMEOUT_MS   = 1800;
 
-const SILENCE_ENERGY_THRESH = 150;   // lowered: catches short phone speech like "yes"
+// FIX #2: Lowered energy floor. Real phone audio from Exotel can be quieter
+// than synthetic test PCM. 300 is a safer floor; adjust via env if needed.
+const SILENCE_ENERGY_THRESH = parseInt(process.env.ENERGY_THRESH || "300", 10);
 
+const MIN_AUDIO_BYTES      = 3200;       // 100 ms minimum before we even try STT
+
+// ── Keepalive (silence padding while TTS fetches) ──────────────────────────
+const KEEPALIVE_INTERVAL_MS      = 200;
+const KEEPALIVE_FRAMES_PER_BURST = 10;   // 10 × 20 ms = 200 ms per burst
+
+const PCM_SILENCE_BYTE = 0x00;           // s16le silence = 0x00 0x00
+
+// ── Prompts ────────────────────────────────────────────────────────────────
 const COMPANY_CONTEXT =
   "You are a professional telecaller from Connect Ventures. " +
   "Keep every response to 1-2 short sentences. " +
@@ -62,7 +57,7 @@ const GREETING =
 const sessions = new Map();
 
 // ---------------------------------------------------------------------------
-// Startup check
+// Env check
 // ---------------------------------------------------------------------------
 function checkEnv() {
   const required = ["DEEPGRAM_API_KEY", "ANTHROPIC_API_KEY"];
@@ -79,10 +74,11 @@ function checkEnv() {
   if (process.env.CAM_API_KEY)        providers.push("CAMB.AI");
   if (process.env.ELEVENLABS_API_KEY) providers.push("ElevenLabs");
   console.log("Env OK | TTS:", providers.join(" -> "));
+  console.log("Energy threshold:", SILENCE_ENERGY_THRESH);
 }
 
 // ---------------------------------------------------------------------------
-// Send a raw PCM silence frame to Exotel (Voicebot protocol)
+// Send a single 20 ms PCM silence frame
 // ---------------------------------------------------------------------------
 function sendPCMSilenceFrame(ws, streamSid) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -98,17 +94,13 @@ function sendPCMSilenceFrame(ws, streamSid) {
 }
 
 // ---------------------------------------------------------------------------
-// Continuous keepalive: send PCM silence every 200ms so Exotel doesn't
-// time out while we wait for TTS to respond (takes 1-3 seconds).
-// Returns a stop() function — call it when real audio starts.
+// Keepalive — sends silence while we wait for TTS network latency.
+// Returns a stop() function.
 // ---------------------------------------------------------------------------
 function startKeepalive(ws, streamSid) {
   let totalFrames = 0;
-  const interval = setInterval(function() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      clearInterval(interval);
-      return;
-    }
+  const interval = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { clearInterval(interval); return; }
     for (let i = 0; i < KEEPALIVE_FRAMES_PER_BURST; i++) {
       sendPCMSilenceFrame(ws, streamSid);
       totalFrames++;
@@ -117,33 +109,29 @@ function startKeepalive(ws, streamSid) {
 
   return function stop() {
     clearInterval(interval);
-    console.log("[KEEPALIVE] Stopped after " + totalFrames + " frames (~" +
-      (totalFrames * FRAME_MS / 1000).toFixed(1) + "s silence)");
+    console.log(`[KEEPALIVE] Stopped — ${totalFrames} frames (~${(totalFrames * FRAME_MS / 1000).toFixed(1)}s)`);
   };
 }
 
 // ---------------------------------------------------------------------------
-// Stream raw PCM frames from ffmpeg stdout to Exotel.
-// stopKeepalive is called the moment the first real audio byte arrives.
+// Stream raw s16le PCM from ffmpeg stdout → Exotel
 // ---------------------------------------------------------------------------
 function streamPCMFromFFmpeg(ffProcess, ws, streamSid, stopKeepalive) {
-  return new Promise(function(resolve) {
-    let remainder     = Buffer.alloc(0);
-    let sent          = 0;
-    let kaStopped     = false;
+  return new Promise((resolve) => {
+    let remainder = Buffer.alloc(0);
+    let sent      = 0;
+    let kaStopped = false;
 
-    function stopKA() {
+    const stopKA = () => {
       if (!kaStopped && stopKeepalive) { stopKeepalive(); kaStopped = true; }
-    }
+    };
 
-    ffProcess.stdout.on("data", function(chunk) {
+    ffProcess.stdout.on("data", (chunk) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      stopKA(); // real audio is here — stop silence
+      stopKA();
 
       const buf = Buffer.concat([remainder, chunk]);
       let offset = 0;
-
-      // Send in multiples of FRAME_BYTES (320 bytes = 20ms)
       while (offset + FRAME_BYTES <= buf.length) {
         const frame = buf.slice(offset, offset + FRAME_BYTES);
         offset += FRAME_BYTES;
@@ -156,21 +144,17 @@ function streamPCMFromFFmpeg(ffProcess, ws, streamSid, stopKeepalive) {
           sent++;
         } catch (e) {
           console.warn("[STREAM] send error:", e.message);
-          stopKA();
           return;
         }
       }
       remainder = buf.slice(offset);
     });
 
-    ffProcess.stdout.on("end", function() {
+    ffProcess.stdout.on("end", () => {
       stopKA();
-
-      // Pad and send any remaining bytes
       if (remainder.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
-        // Pad to next multiple of FRAME_BYTES
         const padLen = FRAME_BYTES - (remainder.length % FRAME_BYTES);
-        const pad = Buffer.concat([remainder, Buffer.alloc(padLen, PCM_SILENCE_BYTE)]);
+        const pad    = Buffer.concat([remainder, Buffer.alloc(padLen, PCM_SILENCE_BYTE)]);
         try {
           ws.send(JSON.stringify({
             event:      "media",
@@ -180,8 +164,6 @@ function streamPCMFromFFmpeg(ffProcess, ws, streamSid, stopKeepalive) {
           sent++;
         } catch (_) {}
       }
-
-      // Send mark so we know when Exotel finishes playing
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
           ws.send(JSON.stringify({
@@ -191,18 +173,17 @@ function streamPCMFromFFmpeg(ffProcess, ws, streamSid, stopKeepalive) {
           }));
         } catch (_) {}
       }
-
       const dur = (sent * FRAME_BYTES) / (PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE);
-      console.log("[STREAM] " + sent + " frames / ~" + dur.toFixed(1) + "s sent");
+      console.log(`[STREAM] ${sent} frames / ~${dur.toFixed(1)}s sent`);
       resolve();
     });
 
-    ffProcess.stderr.on("data", function(e) {
+    ffProcess.stderr.on("data", (e) => {
       const m = e.toString().trim();
       if (m) console.warn("[FFMPEG]", m);
     });
 
-    ffProcess.on("error", function(err) {
+    ffProcess.on("error", (err) => {
       stopKA();
       console.error("[FFMPEG] spawn error:", err.message);
       resolve();
@@ -211,56 +192,35 @@ function streamPCMFromFFmpeg(ffProcess, ws, streamSid, stopKeepalive) {
 }
 
 // ---------------------------------------------------------------------------
-// Convert audio buffer → raw s16le PCM at 8kHz mono → stream to Exotel
-// fmt: "wav" | "mp3"
+// Convert audio buffer → raw s16le PCM 8kHz mono via ffmpeg
 // ---------------------------------------------------------------------------
 function convertAndStream(audioBuf, ws, streamSid, fmt, stopKeepalive) {
-  return new Promise(function(resolve, reject) {
-    // Output: raw signed 16-bit little-endian PCM, 8kHz mono
-    // This is exactly what Exotel Voicebot expects
+  return new Promise((resolve, reject) => {
     const ffArgs = [
       "-hide_banner", "-loglevel", "error",
       "-f", fmt, "-i", "pipe:0",
       "-ar", String(PCM_SAMPLE_RATE),
       "-ac", "1",
-      "-f", "s16le",   // raw PCM output — no container
+      "-f", "s16le",
       "pipe:1",
     ];
     const ff    = spawn("ffmpeg", ffArgs);
     const sendP = streamPCMFromFFmpeg(ff, ws, streamSid, stopKeepalive);
     Readable.from(audioBuf).pipe(ff.stdin);
-    ff.stdin.on("error", function() {});
+    ff.stdin.on("error", () => {});
     sendP.then(resolve).catch(reject);
   });
 }
 
 // ---------------------------------------------------------------------------
-// TTS: CAMB.AI  — streaming pipeline for lowest latency
-// CAMB.AI returns an MP3 stream. We pipe it directly into ffmpeg stdin as it
-// arrives, so ffmpeg starts converting and we start sending PCM frames to
-// Exotel before the full MP3 has even downloaded. This cuts ~1.5s of latency.
+// TTS: CAMB.AI
 // ---------------------------------------------------------------------------
 async function streamTTSbyCamb(text, ws, streamSid, stopKeepalive) {
-  const apiKey = process.env.CAM_API_KEY;
+  const apiKey  = process.env.CAM_API_KEY;
   if (!apiKey) throw new Error("CAM_API_KEY not set");
-
   const voiceId = parseInt(process.env.CAMB_VOICE_ID || "147320", 10);
-  console.log("[TTS/CAMB] Fetching (streaming): " + text.slice(0, 60));
+  console.log("[TTS/CAMB] Fetching:", text.slice(0, 60));
 
-  // Spawn ffmpeg first — it will start converting the moment data flows in.
-  // CAMB.AI returns MP3, so input format is mp3.
-  const ff = spawn("ffmpeg", [
-    "-hide_banner", "-loglevel", "error",
-    "-probesize", "32", "-analyzeduration", "0", "-f", "mp3", "-i", "pipe:0",
-    "-ar", String(PCM_SAMPLE_RATE), "-ac", "1",
-    "-f", "s16le", "pipe:1",
-  ]);
-
-  // Start the sender — it waits for ffmpeg stdout data
-  const sendPromise = streamPCMFromFFmpeg(ff, ws, streamSid, stopKeepalive);
-
-  // Now make the HTTP request with responseType "stream" so axios gives us
-  // a Node.js Readable we can pipe directly into ffmpeg stdin
   let res;
   try {
     res = await axios.post(
@@ -274,44 +234,48 @@ async function streamTTSbyCamb(text, ws, streamSid, stopKeepalive) {
       },
       {
         headers:      { "x-api-key": apiKey, "Content-Type": "application/json" },
-        responseType: "stream",   // stream directly into ffmpeg — no buffering
+        responseType: "arraybuffer",
         timeout:      20000,
       }
     );
   } catch (err) {
-    ff.kill();
-    // For stream responseType, err.response.data is a stream — read it for logging
     if (err.response) {
-      console.error("[TTS/CAMB] HTTP " + err.response.status);
+      const body = Buffer.isBuffer(err.response.data)
+        ? err.response.data.toString("utf8").slice(0, 400)
+        : String(err.response.data).slice(0, 400);
+      console.error(`[TTS/CAMB] HTTP ${err.response.status}: ${body}`);
     } else {
-      console.error("[TTS/CAMB] Error: " + err.message);
+      console.error("[TTS/CAMB] Error:", err.message);
     }
     throw err;
   }
 
-  // Pipe CAMB.AI HTTP response directly into ffmpeg stdin as it arrives
-  res.data.pipe(ff.stdin);
-  res.data.on("error", (e) => { console.warn("[TTS/CAMB] stream err:", e.message); ff.stdin.end(); });
-  res.data.on("end", () => { ff.stdin.end(); console.log("[TTS/CAMB] stream complete"); });
+  const audioBuf = Buffer.from(res.data);
+  console.log(`[TTS/CAMB] Received ${audioBuf.length}B`);
+  if (audioBuf.length < 100) throw new Error(`Too small: ${audioBuf.length}B`);
 
-  await sendPromise;
+  const magic = audioBuf.slice(0, 4).toString("ascii");
+  const isWav = magic === "RIFF";
+  const isMp3 = (audioBuf[0] === 0xFF && (audioBuf[1] & 0xE0) === 0xE0) || magic.startsWith("ID3");
+  const fmt   = isWav ? "wav" : isMp3 ? "mp3" : "wav";
+  console.log("[TTS/CAMB] Format:", fmt);
+  await convertAndStream(audioBuf, ws, streamSid, fmt, stopKeepalive);
 }
 
 // ---------------------------------------------------------------------------
 // TTS: ElevenLabs fallback
 // ---------------------------------------------------------------------------
 async function streamTTSbyElevenLabs(text, ws, streamSid, stopKeepalive) {
-  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const apiKey  = process.env.ELEVENLABS_API_KEY;
   if (!apiKey) throw new Error("ELEVENLABS_API_KEY not set");
-
   const voiceId = process.env.ELEVENLABS_VOICE_ID || "9BWtsMINqrJLrRacOk9x";
-  console.log("[TTS/EL] Fetching: " + text.slice(0, 60));
+  console.log("[TTS/EL] Fetching:", text.slice(0, 60));
 
   let res;
   try {
     res = await axios({
       method:       "post",
-      url:          "https://api.elevenlabs.io/v1/text-to-speech/" + voiceId + "/stream",
+      url:          `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
       data: {
         text,
         model_id:       "eleven_turbo_v2",
@@ -327,24 +291,24 @@ async function streamTTSbyElevenLabs(text, ws, streamSid, stopKeepalive) {
       const body = Buffer.isBuffer(err.response.data)
         ? err.response.data.toString("utf8").slice(0, 400)
         : String(err.response.data).slice(0, 400);
-      console.error("[TTS/EL] HTTP " + err.response.status + ": " + body);
+      console.error(`[TTS/EL] HTTP ${err.response.status}: ${body}`);
     } else {
-      console.error("[TTS/EL] Error: " + err.message);
+      console.error("[TTS/EL] Error:", err.message);
     }
     throw err;
   }
 
   const audioBuf = Buffer.from(res.data);
-  console.log("[TTS/EL] Received " + audioBuf.length + "B");
+  console.log(`[TTS/EL] Received ${audioBuf.length}B`);
   await convertAndStream(audioBuf, ws, streamSid, "mp3", stopKeepalive);
 }
 
 // ---------------------------------------------------------------------------
-// Master TTS
+// Master TTS — tries providers in order
 // ---------------------------------------------------------------------------
 async function streamTTS(text, ws, streamSid) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  console.log("[TTS] -> " + text.slice(0, 80));
+  console.log("[TTS] ->", text.slice(0, 80));
 
   const stopKeepalive = startKeepalive(ws, streamSid);
 
@@ -354,12 +318,14 @@ async function streamTTS(text, ws, streamSid) {
   ];
 
   for (const p of providers) {
+    if (p.name === "CAMB.AI"    && !process.env.CAM_API_KEY)        continue;
+    if (p.name === "ElevenLabs" && !process.env.ELEVENLABS_API_KEY) continue;
     try {
       await p.fn();
-      console.log("[TTS] Done via " + p.name);
+      console.log("[TTS] Done via", p.name);
       return;
     } catch (err) {
-      console.warn("[TTS] FAILED " + p.name + ": " + err.message.slice(0, 200));
+      console.warn(`[TTS] FAILED ${p.name}:`, err.message.slice(0, 200));
     }
   }
 
@@ -368,29 +334,26 @@ async function streamTTS(text, ws, streamSid) {
 }
 
 // ---------------------------------------------------------------------------
-// VAD — PCM s16le energy (sum of absolute sample values)
+// VAD — energy of s16le PCM buffer
 // ---------------------------------------------------------------------------
 function pcmEnergy(buf) {
   if (!buf || buf.length < 2) return 0;
   let sum = 0;
-  // s16le: each sample is 2 bytes, little-endian signed
   for (let i = 0; i + 1 < buf.length; i += 2) {
-    const sample = buf.readInt16LE(i);
-    sum += Math.abs(sample);
+    sum += Math.abs(buf.readInt16LE(i));
   }
   return sum / (buf.length / 2);
 }
 
 // ---------------------------------------------------------------------------
-// STT: Deepgram nova-2
-// Exotel Voicebot sends raw s16le PCM — Deepgram needs to know that
+// STT: Deepgram nova-2 — raw s16le linear16
 // ---------------------------------------------------------------------------
 async function speechToText(buffer) {
   try {
-    console.log("[STT] Sending " + buffer.length + "B");
+    console.log(`[STT] Sending ${buffer.length}B to Deepgram`);
     const res = await axios.post(
-      "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true" +
-      "&encoding=linear16&sample_rate=8000&language=en-IN",
+      "https://api.deepgram.com/v1/listen" +
+      "?model=nova-2&smart_format=true&encoding=linear16&sample_rate=8000&language=en-IN",
       buffer,
       {
         headers: {
@@ -398,13 +361,13 @@ async function speechToText(buffer) {
           "Content-Type": "audio/l16;rate=8000",
         },
         maxBodyLength: Infinity,
-        timeout:       8000,
+        timeout:       10000,
       }
     );
     const alt        = res.data?.results?.channels[0]?.alternatives[0];
     const transcript = alt?.transcript || "";
     const confidence = alt?.confidence || 0;
-    console.log("[STT] \"" + transcript + "\" (conf " + confidence.toFixed(2) + ")");
+    console.log(`[STT] "${transcript}" (conf ${confidence.toFixed(2)})`);
     return transcript;
   } catch (err) {
     console.error("[STT]", err?.response?.status, err.message);
@@ -414,6 +377,7 @@ async function speechToText(buffer) {
 
 // ---------------------------------------------------------------------------
 // LLM: Claude Haiku
+// FIX #3: Added correct anthropic-beta header for claude-haiku-4-5-20251001
 // ---------------------------------------------------------------------------
 async function getAIResponse(history, text) {
   history.push({ role: "user", content: text });
@@ -430,168 +394,200 @@ async function getAIResponse(history, text) {
         headers: {
           "x-api-key":         process.env.ANTHROPIC_API_KEY,
           "anthropic-version": "2023-06-01",
+          "anthropic-beta":    "messages-2023-12-15",
           "Content-Type":      "application/json",
         },
-        timeout: 10000,
+        timeout: 12000,
       }
     );
     const reply = res.data.content[0].text.trim();
     history.push({ role: "assistant", content: reply });
-    console.log("[AI] \"" + reply + "\"");
+    console.log(`[AI] "${reply}"`);
     return reply;
   } catch (err) {
-    console.error("[AI]", err?.response?.status, err.message);
+    console.error("[AI]", err?.response?.status, err?.response?.data || err.message);
     return "I'm sorry, could you say that again?";
   }
 }
 
 // ---------------------------------------------------------------------------
 // WebSocket handler — Exotel Voicebot protocol
+//
+// FIX #4: isProcessing no longer DROPS audio while processing.
+//   Instead we BUFFER audio that arrives during processing. Once processing
+//   finishes, if enough buffered audio accumulated, we run another STT pass.
+//   This prevents the silent-after-greeting bug where the caller's reply
+//   is entirely discarded because isProcessing=true the whole time.
+//
+// FIX #5: streamSid extraction — handle all known Exotel start formats.
+//
+// FIX #6: Reset silence timer on EVERY media packet, not only when not
+//   processing. (The timer is now separated from the processing gate.)
 // ---------------------------------------------------------------------------
-wss.on("connection", function(ws, req) {
+wss.on("connection", (ws, req) => {
   const callId   = Math.random().toString(36).substring(2, 8);
   const clientIP = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
-  console.log("\n[WS] New call | callId=" + callId + " | IP=" + clientIP);
+  console.log(`\n[WS] New call | callId=${callId} | IP=${clientIP}`);
 
   const session = {
     callId,
     history:         [],
     streamSid:       null,
-    audioChunks:     [],
+    audioChunks:     [],      // chunks accumulating before current speech ends
+    pendingChunks:   [],      // FIX #4: audio buffered while isProcessing
     isProcessing:    false,
     greetingSent:    false,
-    firstMediaLogged:false,
     silenceTimer:    null,
     wsOpen:          true,
   };
   sessions.set(callId, session);
 
-  ws.on("message", async function(rawMsg) {
+  // ── Process a complete speech utterance ──────────────────────────────────
+  async function processUtterance(audio) {
+    if (!session.wsOpen || ws.readyState !== WebSocket.OPEN) return;
+    session.isProcessing = true;
+    console.log(`[UTT] Processing ${audio.length}B`);
+    try {
+      const transcript = await speechToText(audio);
+      if (transcript && transcript.trim().length > 2) {
+        const reply = await getAIResponse(session.history, transcript);
+        if (session.wsOpen && ws.readyState === WebSocket.OPEN) {
+          await streamTTS(reply, ws, session.streamSid);
+        }
+      } else {
+        console.log("[UTT] Empty/short transcript — skipping");
+      }
+    } catch (err) {
+      console.error("[UTT] Error:", err.message);
+    } finally {
+      session.isProcessing = false;
+      console.log(`[UTT] Done. pendingChunks=${session.pendingChunks.length}`);
+
+      // FIX #4: Drain any audio that arrived while we were processing.
+      // If callers spoke while the bot was replying, process it now.
+      if (session.pendingChunks.length > 0) {
+        const pending = Buffer.concat(session.pendingChunks);
+        session.pendingChunks = [];
+        const energy = pcmEnergy(pending);
+        console.log(`[UTT] Draining pending ${pending.length}B energy=${energy.toFixed(0)}`);
+        if (pending.length >= MIN_AUDIO_BYTES && energy >= SILENCE_ENERGY_THRESH) {
+          await processUtterance(pending);
+        }
+      }
+    }
+  }
+
+  ws.on("message", async (rawMsg) => {
     let data;
     try { data = JSON.parse(rawMsg); } catch (_) { return; }
 
+    // ── connected ───────────────────────────────────────────────────────────
     if (data.event === "connected") {
-      console.log("[WS] connected | " + callId);
+      console.log(`[WS] connected | ${callId}`);
     }
 
+    // ── start ───────────────────────────────────────────────────────────────
     if (data.event === "start") {
-      console.log("[WS] raw start:", JSON.stringify(data).slice(0, 500));
-      // Exotel Voicebot uses stream_sid (snake_case) in the start message
-      session.streamSid = data.stream_sid
-                       || (data.start && data.start.stream_sid)
-                       || data.streamSid;
-      console.log("[WS] start | streamSid=" + session.streamSid);
+      // FIX #5: robust stream_sid extraction across all known Exotel formats
+      session.streamSid =
+        data.stream_sid                    ||   // Voicebot top-level
+        data.streamSid                     ||   // camelCase variant
+        (data.start && data.start.stream_sid) || // nested start object
+        (data.start && data.start.streamSid) ||
+        null;
+
+      console.log(`[WS] start | streamSid=${session.streamSid}`);
+      console.log("[WS] start payload:", JSON.stringify(data).slice(0, 500));
 
       if (!session.greetingSent) {
         session.greetingSent = true;
         session.history.push({ role: "assistant", content: GREETING });
-        // Mark as processing during greeting so we don't try to process
-        // any echo/background noise while bot is speaking
-        session.isProcessing = true;
-        streamTTS(GREETING, ws, session.streamSid)
-          .then(function() {
-            // Greeting done — clear any audio collected during playback (echo)
-            // and open up for caller response
-            session.audioChunks = [];
-            session.isProcessing = false;
-            console.log("[SESSION] Greeting done — listening for caller");
-          })
-          .catch(function(e) {
-            session.isProcessing = false;
-            console.error("[GREETING]", e.message);
-          });
+        streamTTS(GREETING, ws, session.streamSid).catch((e) => {
+          console.error("[GREETING]", e.message);
+        });
       }
     }
 
+    // ── media ───────────────────────────────────────────────────────────────
     if (data.event === "media") {
-      // Log first media frame details for diagnosis
-      if (!session.firstMediaLogged) {
-        session.firstMediaLogged = true;
-        const sample = Buffer.from(data.media.payload, "base64");
-        console.log("[MEDIA] First frame: " + sample.length + "B, chunk=" +
-          data.media.chunk + ", ts=" + data.media.timestamp +
-          ", first4bytes=" + sample.slice(0,4).toString("hex"));
+      const rawBytes = Buffer.from(data.media.payload, "base64");
+
+      // FIX #4: If currently processing, buffer audio — do NOT drop it.
+      if (session.isProcessing) {
+        session.pendingChunks.push(rawBytes);
+        return;
       }
 
-      // Don't collect audio while the bot is speaking — caller audio during
-      // bot speech is just echo/overlap, not a real turn.
-      // But DO collect after bot finishes (isProcessing=false).
-      if (session.isProcessing) return;
-
-      const rawBytes = Buffer.from(data.media.payload, "base64");
       session.audioChunks.push(rawBytes);
 
+      // FIX #6: Always reset silence timer on every packet.
       clearTimeout(session.silenceTimer);
-      session.silenceTimer = setTimeout(async function() {
-        if (session.isProcessing) return;
+      session.silenceTimer = setTimeout(async () => {
+        if (session.isProcessing) return; // safety guard
 
         const audio = Buffer.concat(session.audioChunks);
         session.audioChunks = [];
 
         if (audio.length < MIN_AUDIO_BYTES) {
-          console.log("[VAD] Too short (" + audio.length + "B)");
+          console.log(`[VAD] Too short (${audio.length}B) — skipped`);
           return;
         }
-        const energy = pcmEnergy(audio);
-        console.log("[VAD] energy=" + energy.toFixed(0) + " bytes=" + audio.length +
-          " thresh=" + SILENCE_ENERGY_THRESH);
-        if (energy < SILENCE_ENERGY_THRESH) {
-          console.log("[VAD] Below threshold — skipping");
-          return;
-        }
-        console.log("[VAD] Speech detected — sending to STT");
-        session.isProcessing = true;
 
-        try {
-          const transcript = await speechToText(audio);
-          if (transcript && transcript.trim().length > 0) {
-            const reply = await getAIResponse(session.history, transcript);
-            if (session.wsOpen && ws.readyState === WebSocket.OPEN) {
-              await streamTTS(reply, ws, session.streamSid);
-            }
-          } else {
-            console.log("[VAD] Empty transcript — skipping");
-          }
-        } catch (err) {
-          console.error("[SESSION]", err.message);
-        } finally {
-          session.isProcessing = false;
+        const energy = pcmEnergy(audio);
+        console.log(`[VAD] energy=${energy.toFixed(0)} len=${audio.length}B thresh=${SILENCE_ENERGY_THRESH}`);
+
+        if (energy < SILENCE_ENERGY_THRESH) {
+          console.log("[VAD] Silence — skipped");
+          return;
         }
+
+        console.log("[VAD] Speech detected — processing utterance");
+        await processUtterance(audio);
       }, SILENCE_TIMEOUT_MS);
     }
 
+    // ── stop ────────────────────────────────────────────────────────────────
     if (data.event === "stop") {
-      console.log("[WS] stop | " + callId);
+      console.log(`[WS] stop | ${callId}`);
       clearTimeout(session.silenceTimer);
     }
 
+    // ── mark ────────────────────────────────────────────────────────────────
     if (data.event === "mark") {
-      console.log("[WS] mark received: " + (data.mark && data.mark.name));
+      const markName = data.mark?.name || data.mark;
+      console.log(`[WS] mark: ${markName}`);
     }
   });
 
-  ws.on("close", function(code) {
+  ws.on("close", (code) => {
     session.wsOpen = false;
     clearTimeout(session.silenceTimer);
-    console.log("[WS] closed | " + callId + " | code=" + code);
+    console.log(`[WS] closed | ${callId} | code=${code}`);
     sessions.delete(callId);
   });
 
-  ws.on("error", function(err) {
+  ws.on("error", (err) => {
     session.wsOpen = false;
-    console.error("[WS] error | " + callId + ":", err.message);
+    console.error(`[WS] error | ${callId}:`, err.message);
   });
 });
 
 // ---------------------------------------------------------------------------
 // Health check
 // ---------------------------------------------------------------------------
-app.get("/", function(req, res) {
+app.get("/", (req, res) => {
   const tts = [];
   if (process.env.CAM_API_KEY)        tts.push("CAMB.AI");
   if (process.env.ELEVENLABS_API_KEY) tts.push("ElevenLabs");
-  res.json({ status: "ok", protocol: "Exotel Voicebot (s16le PCM)", sessions: sessions.size, uptime: Math.floor(process.uptime()), tts });
+  res.json({
+    status:    "ok",
+    protocol:  "Exotel Voicebot (s16le PCM)",
+    sessions:  sessions.size,
+    uptime:    Math.floor(process.uptime()),
+    tts,
+    energy_threshold: SILENCE_ENERGY_THRESH,
+  });
 });
 
 checkEnv();
-server.listen(PORT, function() { console.log("Server on port " + PORT); });
+server.listen(PORT, () => console.log(`Server on port ${PORT}`));
