@@ -11,11 +11,16 @@ const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
 const PORT   = process.env.PORT || 10000;
 
-const MULAW_FRAME_BYTES     = 160;
+const MULAW_FRAME_BYTES     = 160;   // 20ms per frame at 8kHz
 const SILENCE_TIMEOUT_MS    = 1200;
 const MIN_AUDIO_BYTES       = 3200;
 const MULAW_SILENCE_BYTE    = 0xFF;
 const SILENCE_ENERGY_THRESH = 5;
+
+// How many ms between keepalive bursts while waiting for TTS
+// 200ms = 10 frames per burst, bursts every 200ms = steady silence stream
+const KEEPALIVE_INTERVAL_MS = 200;
+const KEEPALIVE_FRAMES_PER_BURST = 10; // 200ms of audio per burst
 
 const COMPANY_CONTEXT =
   "You are a professional telecaller from Connect Ventures. " +
@@ -51,32 +56,68 @@ function checkEnv() {
 }
 
 // ---------------------------------------------------------------------------
-// Keep-alive: send silent frames so Exotel does not hang up during TTS fetch.
-// Exotel outbound media events require camelCase `streamSid`.
+// Send a single silent frame to Exotel
 // ---------------------------------------------------------------------------
-function sendKeepAlive(ws, streamSid, frameCount) {
-  frameCount = frameCount || 5;
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const silenceFrame = Buffer.alloc(MULAW_FRAME_BYTES, MULAW_SILENCE_BYTE);
-  const payload      = silenceFrame.toString("base64");
-  for (let i = 0; i < frameCount; i++) {
-    try {
-      ws.send(JSON.stringify({ event: "media", streamSid: streamSid, media: { payload: payload } }));
-    } catch (_) {}
+function sendSilenceFrame(ws, streamSid) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  const frame = Buffer.alloc(MULAW_FRAME_BYTES, MULAW_SILENCE_BYTE);
+  try {
+    ws.send(JSON.stringify({
+      event:     "media",
+      streamSid: streamSid,
+      media:     { payload: frame.toString("base64") },
+    }));
+    return true;
+  } catch (_) {
+    return false;
   }
-  console.log("[KEEPALIVE] Sent " + frameCount + " silent frames");
+}
+
+// ---------------------------------------------------------------------------
+// Start a continuous keepalive interval — sends silence every 200ms.
+// This is the KEY FIX: Exotel's Stream applet requires a steady audio stream.
+// If it receives no audio for ~1-2 seconds it hangs up (code=1006).
+// We send silence bursts every 200ms until real audio is ready.
+// Returns a stop function — call stop() once real audio starts playing.
+// ---------------------------------------------------------------------------
+function startKeepalive(ws, streamSid) {
+  let totalFrames = 0;
+  const interval = setInterval(function() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      clearInterval(interval);
+      return;
+    }
+    for (let i = 0; i < KEEPALIVE_FRAMES_PER_BURST; i++) {
+      sendSilenceFrame(ws, streamSid);
+      totalFrames++;
+    }
+  }, KEEPALIVE_INTERVAL_MS);
+
+  return function stop() {
+    clearInterval(interval);
+    console.log("[KEEPALIVE] Stopped after " + totalFrames + " silence frames (~" + (totalFrames * 20 / 1000).toFixed(1) + "s)");
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Stream mulaw frames to Exotel as ffmpeg produces them.
 // ---------------------------------------------------------------------------
-function streamMulawFromFFmpeg(ffProcess, ws, streamSid) {
+function streamMulawFromFFmpeg(ffProcess, ws, streamSid, stopKeepalive) {
   return new Promise(function(resolve) {
-    var remainder = Buffer.alloc(0);
-    var sent      = 0;
+    var remainder      = Buffer.alloc(0);
+    var sent           = 0;
+    var keepaliveDone  = false;
 
     ffProcess.stdout.on("data", function(chunk) {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      // Stop silence the moment real audio starts flowing
+      if (!keepaliveDone && stopKeepalive) {
+        stopKeepalive();
+        keepaliveDone = true;
+        console.log("[STREAM] Real audio started — keepalive stopped");
+      }
+
       var buf    = Buffer.concat([remainder, chunk]);
       var offset = 0;
       while (offset + MULAW_FRAME_BYTES <= buf.length) {
@@ -91,6 +132,7 @@ function streamMulawFromFFmpeg(ffProcess, ws, streamSid) {
           sent++;
         } catch (e) {
           console.warn("[STREAM] send failed:", e.message);
+          if (stopKeepalive && !keepaliveDone) { stopKeepalive(); keepaliveDone = true; }
           return;
         }
       }
@@ -98,6 +140,8 @@ function streamMulawFromFFmpeg(ffProcess, ws, streamSid) {
     });
 
     ffProcess.stdout.on("end", function() {
+      if (stopKeepalive && !keepaliveDone) { stopKeepalive(); keepaliveDone = true; }
+
       if (remainder.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
         var pad = Buffer.alloc(MULAW_FRAME_BYTES, MULAW_SILENCE_BYTE);
         remainder.copy(pad);
@@ -126,6 +170,7 @@ function streamMulawFromFFmpeg(ffProcess, ws, streamSid) {
     });
 
     ffProcess.on("error", function(err) {
+      if (stopKeepalive && !keepaliveDone) { stopKeepalive(); keepaliveDone = true; }
       console.error("[FFMPEG] spawn error:", err.message);
       resolve();
     });
@@ -133,10 +178,10 @@ function streamMulawFromFFmpeg(ffProcess, ws, streamSid) {
 }
 
 // ---------------------------------------------------------------------------
-// Convert an audio buffer to 8kHz mulaw and stream to Exotel.
-// fmt: "wav" | "mp3"   (auto-detected from magic bytes before calling)
+// Convert audio buffer to 8kHz mulaw and stream to Exotel.
+// stopKeepalive is called the moment real audio bytes start flowing.
 // ---------------------------------------------------------------------------
-function convertAndStream(audioBuf, ws, streamSid, fmt) {
+function convertAndStream(audioBuf, ws, streamSid, fmt, stopKeepalive) {
   return new Promise(function(resolve, reject) {
     var ffArgs = [
       "-hide_banner", "-loglevel", "error",
@@ -145,7 +190,7 @@ function convertAndStream(audioBuf, ws, streamSid, fmt) {
       "-acodec", "pcm_mulaw", "-f", "mulaw", "pipe:1",
     ];
     var ff    = spawn("ffmpeg", ffArgs);
-    var sendP = streamMulawFromFFmpeg(ff, ws, streamSid);
+    var sendP = streamMulawFromFFmpeg(ff, ws, streamSid, stopKeepalive);
     Readable.from(audioBuf).pipe(ff.stdin);
     ff.stdin.on("error", function() {});
     sendP.then(resolve).catch(reject);
@@ -154,28 +199,13 @@ function convertAndStream(audioBuf, ws, streamSid, fmt) {
 
 // ---------------------------------------------------------------------------
 // TTS PROVIDER 1: CAMB.AI
-//
-// KEY FIX — responseType changed from "stream" to "arraybuffer":
-//   With responseType "stream", axios does NOT throw on 4xx — it returns the
-//   raw http.IncomingMessage (a TLSSocket). When the catch block tried to
-//   JSON.stringify(err.response.data), it hit the TLSSocket circular reference
-//   and crashed: "Converting circular structure to JSON --> TLSSocket".
-//   With "arraybuffer" we get a plain Buffer, axios throws correctly on 4xx,
-//   and we can safely log the error body from CAMB.AI.
-//
-// language: "english" — CAMB.AI mars-flash uses full English word, not ISO code.
-//   "en" and "en-in" both return 422.
-//
-// Removed inference_options — not valid for mars-flash, causes 422.
-//
-// Auto-detect WAV vs MP3 from magic bytes so the code is format-agnostic.
 // ---------------------------------------------------------------------------
-async function streamTTSbyCamb(text, ws, streamSid) {
+async function streamTTSbyCamb(text, ws, streamSid, stopKeepalive) {
   var apiKey = process.env.CAM_API_KEY;
   if (!apiKey) throw new Error("CAM_API_KEY not set");
 
   var voiceId = parseInt(process.env.CAMB_VOICE_ID || "147320", 10);
-  console.log("[TTS/CAMB] voice=" + voiceId + " | " + text.slice(0, 60));
+  console.log("[TTS/CAMB] Fetching audio for: " + text.slice(0, 60));
 
   var res;
   try {
@@ -213,29 +243,24 @@ async function streamTTSbyCamb(text, ws, streamSid) {
     throw new Error("CAMB.AI returned too-small buffer: " + audioBuf.length + "B");
   }
 
-  // Detect format from magic bytes
   var magic = audioBuf.slice(0, 4).toString("ascii");
   var isWav = magic === "RIFF";
   var isMp3 = (audioBuf[0] === 0xFF && (audioBuf[1] & 0xE0) === 0xE0) || magic.startsWith("ID3");
   var fmt   = isWav ? "wav" : isMp3 ? "mp3" : "wav";
-  console.log("[TTS/CAMB] Detected format: " + fmt + " (magic bytes: " + magic + ")");
+  console.log("[TTS/CAMB] Format: " + fmt);
 
-  await convertAndStream(audioBuf, ws, streamSid, fmt);
+  await convertAndStream(audioBuf, ws, streamSid, fmt, stopKeepalive);
 }
 
 // ---------------------------------------------------------------------------
 // TTS PROVIDER 2: ElevenLabs
-//
-// Uses mp3_44100_128 — works on ALL ElevenLabs plan tiers including free.
-// If you still get 401, your ELEVENLABS_API_KEY in Render env vars is
-// wrong or expired. Go to Render dashboard -> Environment -> check the value.
 // ---------------------------------------------------------------------------
-async function streamTTSbyElevenLabs(text, ws, streamSid) {
+async function streamTTSbyElevenLabs(text, ws, streamSid, stopKeepalive) {
   var apiKey = process.env.ELEVENLABS_API_KEY;
   if (!apiKey) throw new Error("ELEVENLABS_API_KEY not set");
 
   var voiceId = process.env.ELEVENLABS_VOICE_ID || "9BWtsMINqrJLrRacOk9x";
-  console.log("[TTS/EL] voice=" + voiceId + " | " + text.slice(0, 60));
+  console.log("[TTS/EL] Fetching audio for: " + text.slice(0, 60));
 
   var res;
   try {
@@ -266,21 +291,24 @@ async function streamTTSbyElevenLabs(text, ws, streamSid) {
 
   var audioBuf = Buffer.from(res.data);
   console.log("[TTS/EL] Received " + audioBuf.length + "B mp3");
-  await convertAndStream(audioBuf, ws, streamSid, "mp3");
+  await convertAndStream(audioBuf, ws, streamSid, "mp3", stopKeepalive);
 }
 
 // ---------------------------------------------------------------------------
-// Master TTS: try providers in order, send silence if all fail
+// Master TTS: start keepalive FIRST, then fetch audio, stop keepalive
+// when real audio starts flowing. This guarantees Exotel never times out.
 // ---------------------------------------------------------------------------
 async function streamTTS(text, ws, streamSid) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   console.log("[TTS] -> " + text.slice(0, 80));
 
-  sendKeepAlive(ws, streamSid, 5);
+  // Start continuous silence stream immediately — keeps Exotel alive
+  // while we wait for CAMB.AI (which takes 1-3 seconds to respond)
+  var stopKeepalive = startKeepalive(ws, streamSid);
 
   var providers = [
-    { name: "CAMB.AI",    fn: function() { return streamTTSbyCamb(text, ws, streamSid); } },
-    { name: "ElevenLabs", fn: function() { return streamTTSbyElevenLabs(text, ws, streamSid); } },
+    { name: "CAMB.AI",    fn: function() { return streamTTSbyCamb(text, ws, streamSid, stopKeepalive); } },
+    { name: "ElevenLabs", fn: function() { return streamTTSbyElevenLabs(text, ws, streamSid, stopKeepalive); } },
   ];
 
   for (var i = 0; i < providers.length; i++) {
@@ -294,6 +322,9 @@ async function streamTTS(text, ws, streamSid) {
     }
   }
 
+  // All providers failed — stop keepalive, send 2s of silence so caller
+  // hears something rather than abrupt silence
+  stopKeepalive();
   console.error("[TTS] All providers failed — sending silence");
   var buf    = Buffer.alloc(16000, MULAW_SILENCE_BYTE);
   var offset = 0;
@@ -410,6 +441,9 @@ wss.on("connection", function(ws, req) {
     }
 
     if (data.event === "start") {
+      // Log the raw payload once so we can verify streamSid structure
+      console.log("[WS] raw start:", JSON.stringify(data).slice(0, 400));
+
       session.streamSid = (data.start && (data.start.stream_sid || data.start.streamSid))
                        || data.streamSid
                        || data.stream_sid;
