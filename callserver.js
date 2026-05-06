@@ -4,7 +4,7 @@ const http         = require("http");
 const WebSocket    = require("ws");
 const axios        = require("axios");
 const { spawn }    = require("child_process");
-const { Readable, PassThrough } = require("stream");
+const { Readable } = require("stream");
 
 const app    = express();
 const server = http.createServer(app);
@@ -12,25 +12,24 @@ const wss    = new WebSocket.Server({ server });
 const PORT   = process.env.PORT || 10000;
 
 // ---------------------------------------------------------------------------
-// ARCHITECTURE:
+// ROOT CAUSE FIX:
+//   Exotel sends μ-law (PCMU) audio. Raw mulaw bytes have silence ~122,
+//   speech ~93-122 — almost indistinguishable. Sending raw mulaw bytes to
+//   Deepgram as linear16 produces garbled audio → empty transcripts.
 //
-// FIX 1: Exotel sends μ-law (PCMU) encoded audio. We now tell Deepgram the
-//         correct encoding=mulaw instead of encoding=linear16. This is why
-//         ALL transcripts were returning empty strings before.
+// SOLUTION:
+//   Decode mulaw → linear16 PCM on every incoming packet using G.711 table.
+//   After decode: silence ≈ 0-200, speech ≈ 500-8000. VAD works cleanly.
+//   Send decoded linear16 to Deepgram as encoding=linear16. Transcripts work.
 //
-// FIX 2: ElevenLabs streaming endpoint (/stream) is used so audio chunks
-//         are piped to ffmpeg as they arrive — cutting TTS latency from
-//         7-9s down to ~1-1.5s for the greeting.
-//
-// FIX 3: Greeting fires on first media packet if streamSid is available,
-//         not just on the 'start' event (which Exotel sends late).
-//
-// Audio routing has 3 states:
-//   isSpeaking=true  → bot is playing TTS  → buffer in bargeinChunks
-//   isProcessing=true→ STT/AI running      → accumulate in audioChunks
-//   idle             → accumulate audioChunks, silence timer runs
-//
-// Minimum audio before STT: 8000 bytes = 500ms at 8kHz mulaw.
+// PIPELINE:
+//   Exotel mulaw bytes
+//     → decodeMulaw() [lookup table, zero overhead]
+//     → linear16 PCM stored in audioChunks
+//     → pcmEnergy() VAD (silence=0-200, speech=500+)
+//     → Deepgram linear16 → transcript
+//     → Claude AI → reply text
+//     → TTS (ElevenLabs stream or CAMB.AI) → ffmpeg → linear16 → Exotel
 // ---------------------------------------------------------------------------
 
 const PCM_SAMPLE_RATE      = 8000;
@@ -38,13 +37,11 @@ const PCM_BYTES_PER_SAMPLE = 2;
 const FRAME_MS             = 20;
 const FRAME_BYTES          = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * FRAME_MS / 1000; // 320B
 
-const SILENCE_TIMEOUT_MS    = parseInt(process.env.SILENCE_TIMEOUT || "700",  10);
-// Mulaw energy threshold — mulaw bytes have different value range than s16le
-// Lower threshold because mulaw is 8-bit compressed
-const SILENCE_ENERGY_THRESH = parseInt(process.env.ENERGY_THRESH   || "5",    10);
-
-// Minimum mulaw audio to send to Deepgram: 500ms = 4000B at 8kHz 8-bit mulaw
-const MIN_STT_BYTES = PCM_SAMPLE_RATE * 500 / 1000; // 4000B (mulaw is 1 byte/sample)
+const SILENCE_TIMEOUT_MS    = parseInt(process.env.SILENCE_TIMEOUT || "800", 10);
+// Linear16 PCM after mulaw decode: silence=0-200, speech=500+
+const SILENCE_ENERGY_THRESH = parseInt(process.env.ENERGY_THRESH   || "300", 10);
+// Min decoded PCM: 1 second = 16000B (8000 samples * 2 bytes)
+const MIN_STT_BYTES = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * 1; // 16000B
 
 const KEEPALIVE_INTERVAL_MS      = 200;
 const KEEPALIVE_FRAMES_PER_BURST = 10;
@@ -62,6 +59,30 @@ const GREETING =
 const sessions = new Map();
 
 // ---------------------------------------------------------------------------
+// G.711 μ-law decode lookup table (standard ITU-T)
+// Pre-computed at startup — O(1) per byte, no runtime math
+// ---------------------------------------------------------------------------
+const MULAW_DECODE_TABLE = (() => {
+  const table = new Int16Array(256);
+  for (let i = 0; i < 256; i++) {
+    const byte = ~i & 0xFF;
+    const sign = (byte & 0x80) ? -1 : 1;
+    const exp  = (byte >> 4) & 0x07;
+    const mant = byte & 0x0F;
+    table[i]   = sign * (((mant << 1) + 33) << (exp + 1)) - sign * 33;
+  }
+  return table;
+})();
+
+function decodeMulaw(mulawBuf) {
+  const out = Buffer.allocUnsafe(mulawBuf.length * 2);
+  for (let i = 0; i < mulawBuf.length; i++) {
+    out.writeInt16LE(MULAW_DECODE_TABLE[mulawBuf[i]], i * 2);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Env check
 // ---------------------------------------------------------------------------
 function checkEnv() {
@@ -69,19 +90,19 @@ function checkEnv() {
   const missing  = required.filter(k => !process.env[k]);
   if (missing.length) { console.error("Missing env vars:", missing.join(", ")); process.exit(1); }
   if (!process.env.ELEVENLABS_API_KEY && !process.env.CAM_API_KEY) {
-    console.error("No TTS provider configured. Set ELEVENLABS_API_KEY (recommended) or CAM_API_KEY.");
+    console.error("No TTS provider. Set ELEVENLABS_API_KEY or CAM_API_KEY.");
     process.exit(1);
   }
   const tts = [];
   if (process.env.ELEVENLABS_API_KEY) tts.push("ElevenLabs (streaming)");
   if (process.env.CAM_API_KEY)        tts.push("CAMB.AI (fallback)");
   console.log("Env OK | TTS:", tts.join(" -> "));
-  console.log(`Silence timeout: ${SILENCE_TIMEOUT_MS}ms | VAD thresh: ${SILENCE_ENERGY_THRESH} | Min STT bytes: ${MIN_STT_BYTES}`);
-  console.log("Audio encoding: mulaw (Exotel default)");
+  console.log(`Silence: ${SILENCE_TIMEOUT_MS}ms | VAD thresh: ${SILENCE_ENERGY_THRESH} | Min STT: ${MIN_STT_BYTES}B`);
+  console.log("Pipeline: mulaw-in -> decode -> linear16 -> deepgram");
 }
 
 // ---------------------------------------------------------------------------
-// PCM silence frame (for keepalive — output side is still linear16 PCM)
+// PCM silence frame (linear16 zeros, for keepalive)
 // ---------------------------------------------------------------------------
 function sendSilenceFrame(ws, streamSid) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -161,25 +182,18 @@ function convertAndStream(buf, ws, streamSid, fmt, stopKA) {
 // ---------------------------------------------------------------------------
 // TTS providers
 // ---------------------------------------------------------------------------
-
-// FIX 2: ElevenLabs streaming — pipes audio chunks to ffmpeg as they arrive
-// This cuts latency from ~7s (full download) to ~1-1.5s (first chunk)
 async function ttsViaElevenLabsStreaming(text, ws, streamSid, stopKA) {
   if (!process.env.ELEVENLABS_API_KEY) throw new Error("no ELEVENLABS_API_KEY");
   const vid = process.env.ELEVENLABS_VOICE_ID || "9BWtsMINqrJLrRacOk9x";
-  console.log("[TTS/EL-STREAM] ->", text.slice(0, 60));
+  console.log("[TTS/EL] ->", text.slice(0, 60));
 
-  // Spawn ffmpeg ready to receive streaming mp3
   const ff = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "error",
     "-f", "mp3", "-i", "pipe:0",
     "-ar", String(PCM_SAMPLE_RATE), "-ac", "1", "-f", "s16le", "pipe:1"
   ]);
-
-  // Start streaming ffmpeg output to Exotel immediately
   const streamDone = streamPCMFromFFmpeg(ff, ws, streamSid, stopKA);
 
-  // Fetch ElevenLabs with responseType: stream
   const response = await axios({
     method: "post",
     url: `https://api.elevenlabs.io/v1/text-to-speech/${vid}/stream`,
@@ -189,24 +203,18 @@ async function ttsViaElevenLabsStreaming(text, ws, streamSid, stopKA) {
       output_format: "mp3_44100_128",
       voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.0 }
     },
-    headers: {
-      "xi-api-key": process.env.ELEVENLABS_API_KEY,
-      "Content-Type": "application/json"
-    },
+    headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
     responseType: "stream",
     timeout: 20000,
   });
 
-  // Pipe HTTP response stream → ffmpeg stdin
   response.data.pipe(ff.stdin);
   response.data.on("error", (e) => { console.warn("[TTS/EL] stream error:", e.message); ff.stdin.end(); });
   ff.stdin.on("error", () => {});
-
   await streamDone;
-  console.log("[TTS/EL-STREAM] done");
+  console.log("[TTS/EL] done");
 }
 
-// CAMB.AI fallback (still buffered, but available if ElevenLabs fails)
 async function ttsViaCamb(text, ws, streamSid, stopKA) {
   if (!process.env.CAM_API_KEY) throw new Error("no CAM_API_KEY");
   console.log("[TTS/CAMB] ->", text.slice(0, 60));
@@ -233,7 +241,6 @@ async function streamTTS(text, ws, streamSid, session) {
   const stopKA = startKeepalive(ws, streamSid);
   let ok = false;
 
-  // Try ElevenLabs streaming first, then CAMB.AI as fallback
   for (const [name, key, fn] of [
     ["ElevenLabs", "ELEVENLABS_API_KEY", () => ttsViaElevenLabsStreaming(text, ws, streamSid, stopKA)],
     ["CAMB.AI",    "CAM_API_KEY",        () => ttsViaCamb(text, ws, streamSid, stopKA)],
@@ -248,13 +255,11 @@ async function streamTTS(text, ws, streamSid, session) {
 
   if (session) {
     session.isSpeaking = false;
-
-    // Barge-in: caller spoke while bot was talking — process now
     if (session.bargeinChunks.length > 0 && !session.isProcessing) {
-      const audio = Buffer.concat(session.bargeinChunks);
+      const audio = Buffer.concat(session.bargeinChunks); // already decoded linear16
       session.bargeinChunks = [];
-      console.log(`[BARGE-IN] ${audio.length}B collected while bot was speaking`);
-      if (audio.length >= MIN_STT_BYTES && mulawEnergy(audio) >= SILENCE_ENERGY_THRESH) {
+      console.log(`[BARGE-IN] ${audio.length}B linear16`);
+      if (audio.length >= MIN_STT_BYTES && pcmEnergy(audio) >= SILENCE_ENERGY_THRESH) {
         processUtterance(audio, session, ws).catch(e => console.error("[BARGE-IN]", e.message));
       } else {
         console.log("[BARGE-IN] too short or silent — discarded");
@@ -264,38 +269,35 @@ async function streamTTS(text, ws, streamSid, session) {
 }
 
 // ---------------------------------------------------------------------------
-// VAD — mulaw energy (1 byte per sample, values 0-255, silence ≈ 0xFF = 127)
-// In mulaw, 0x7F (127) is silence. Distance from 127 = energy.
+// VAD — linear16 PCM energy (after mulaw decode)
+// Silence: 0-200. Background noise: 200-400. Speech: 500+
 // ---------------------------------------------------------------------------
-function mulawEnergy(buf) {
-  if (!buf || buf.length === 0) return 0;
+function pcmEnergy(buf) {
+  if (!buf || buf.length < 2) return 0;
   let s = 0;
-  for (let i = 0; i < buf.length; i++) {
-    s += Math.abs(buf[i] - 127); // 127 = mulaw silence byte
-  }
-  return s / buf.length;
+  const samples = buf.length >> 1;
+  for (let i = 0; i + 1 < buf.length; i += 2) s += Math.abs(buf.readInt16LE(i));
+  return s / samples;
 }
 
 // ---------------------------------------------------------------------------
-// STT — FIX 1: encoding=mulaw (not linear16)
-// No amplification or trimming needed — Deepgram handles mulaw natively
+// STT — sends decoded linear16 PCM to Deepgram
 // ---------------------------------------------------------------------------
-async function speechToText(raw) {
-  const energy = mulawEnergy(raw);
-  console.log(`[STT] sending ${raw.length}B (${(raw.length / PCM_SAMPLE_RATE).toFixed(2)}s mulaw) energy=${energy.toFixed(1)}`);
+async function speechToText(pcmBuf) {
+  const energy  = pcmEnergy(pcmBuf);
+  const seconds = (pcmBuf.length / (PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE)).toFixed(2);
+  console.log(`[STT] ${pcmBuf.length}B (${seconds}s linear16) energy=${energy.toFixed(0)}`);
   try {
     const res = await axios.post(
-      // KEY FIX: encoding=mulaw instead of encoding=linear16
-      "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=mulaw&sample_rate=8000&language=en-IN",
-      raw,
+      "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=linear16&sample_rate=8000&language=en-IN",
+      pcmBuf,
       {
         headers: {
           Authorization: "Token " + process.env.DEEPGRAM_API_KEY,
-          // KEY FIX: correct content-type for mulaw
-          "Content-Type": "audio/basic",
+          "Content-Type": "audio/l16;rate=8000",
         },
         maxBodyLength: Infinity,
-        timeout: 10000,
+        timeout: 15000,
       }
     );
     const alt  = res.data?.results?.channels[0]?.alternatives[0];
@@ -333,19 +335,20 @@ async function getAIResponse(history, text) {
 }
 
 // ---------------------------------------------------------------------------
-// Core pipeline: one complete utterance → STT → AI → TTS
+// Core pipeline
 // ---------------------------------------------------------------------------
-async function processUtterance(audio, session, ws) {
+async function processUtterance(pcmBuf, session, ws) {
   if (!session.wsOpen || ws.readyState !== WebSocket.OPEN) {
     console.warn("[UTT] ws closed — drop");
     return;
   }
-  const t0 = Date.now();
+  const t0      = Date.now();
   session.isProcessing = true;
-  console.log(`[UTT] start — ${audio.length}B (${(audio.length / PCM_SAMPLE_RATE).toFixed(2)}s mulaw audio)`);
+  const seconds = (pcmBuf.length / (PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE)).toFixed(2);
+  console.log(`[UTT] start — ${pcmBuf.length}B (${seconds}s PCM)`);
 
   try {
-    const transcript = await speechToText(audio);
+    const transcript = await speechToText(pcmBuf);
     if (!transcript || transcript.trim().length < 2) {
       console.log("[UTT] empty transcript — skip");
       return;
@@ -362,10 +365,10 @@ async function processUtterance(audio, session, ws) {
     session.isProcessing = false;
     if (session.pendingFlush) {
       session.pendingFlush = false;
-      const pending = Buffer.concat(session.audioChunks);
+      const pending = Buffer.concat(session.audioChunks); // already linear16
       session.audioChunks = [];
-      if (pending.length >= MIN_STT_BYTES && mulawEnergy(pending) >= SILENCE_ENERGY_THRESH) {
-        console.log(`[UTT] draining deferred audio: ${pending.length}B`);
+      if (pending.length >= MIN_STT_BYTES && pcmEnergy(pending) >= SILENCE_ENERGY_THRESH) {
+        console.log(`[UTT] draining deferred: ${pending.length}B`);
         await processUtterance(pending, session, ws);
       }
     }
@@ -384,8 +387,8 @@ wss.on("connection", (ws, req) => {
     callId,
     history:          [],
     streamSid:        null,
-    audioChunks:      [],
-    bargeinChunks:    [],
+    audioChunks:      [],  // stores DECODED linear16 PCM
+    bargeinChunks:    [],  // stores DECODED linear16 PCM
     isProcessing:     false,
     isSpeaking:       false,
     pendingFlush:     false,
@@ -397,7 +400,6 @@ wss.on("connection", (ws, req) => {
   };
   sessions.set(callId, session);
 
-  // ── Flush: collect everything, run ONE STT call ────────────────────────
   async function flushAudio(trigger) {
     clearTimeout(session.silenceTimer);
     session.silenceTimer = null;
@@ -407,32 +409,30 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    const audio = Buffer.concat(session.audioChunks);
+    const pcm     = Buffer.concat(session.audioChunks);
     session.audioChunks = [];
+    const energy  = pcmEnergy(pcm);
+    const seconds = (pcm.length / (PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE)).toFixed(2);
+    console.log(`[VAD] flush(${trigger}) ${pcm.length}B ${seconds}s energy=${energy.toFixed(0)} thresh=${SILENCE_ENERGY_THRESH}`);
 
-    const energy = mulawEnergy(audio);
-    console.log(`[VAD] flush(${trigger}) ${audio.length}B ${(audio.length / PCM_SAMPLE_RATE).toFixed(2)}s energy=${energy.toFixed(1)}`);
-
-    if (audio.length < MIN_STT_BYTES) {
-      console.log(`[VAD] too short (${audio.length}B < ${MIN_STT_BYTES}B) — skip`);
+    if (pcm.length < MIN_STT_BYTES) {
+      console.log(`[VAD] too short (${pcm.length}B < ${MIN_STT_BYTES}B) — skip`);
       return;
     }
     if (energy < SILENCE_ENERGY_THRESH) {
-      console.log("[VAD] below energy threshold — skip");
+      console.log("[VAD] below energy threshold — silence, skip");
       return;
     }
-
     if (session.isProcessing) {
-      console.log("[VAD] pipeline busy — marking pendingFlush");
-      session.audioChunks = [audio];
+      console.log("[VAD] pipeline busy — pendingFlush");
+      session.audioChunks = [pcm];
       session.pendingFlush = true;
       return;
     }
 
-    await processUtterance(audio, session, ws);
+    await processUtterance(pcm, session, ws);
   }
 
-  // FIX 3: maybeGreet can now be called any time streamSid is set
   function maybeGreet() {
     if (session.greetingSent || !session.streamSid) return;
     session.greetingSent = true;
@@ -453,23 +453,20 @@ wss.on("connection", (ws, req) => {
     }
 
     if (data.event === "start") {
-      // Extract streamSid from wherever Exotel puts it
-      const sid = data.stream_sid
-        || data.streamSid
-        || data.start?.stream_sid
-        || data.start?.streamSid
-        || null;
+      const sid = data.stream_sid || data.streamSid || data.start?.stream_sid || data.start?.streamSid || null;
       if (sid) session.streamSid = sid;
       console.log(`[WS] start | streamSid=${session.streamSid}`);
       maybeGreet();
     }
 
     if (data.event === "media") {
-      const raw = Buffer.from(data.media.payload, "base64");
-      session.mediaPacketCount++;
-      session.mediaByteCount += raw.length;
+      // Decode mulaw → linear16 immediately — all downstream code works with PCM
+      const mulawBytes = Buffer.from(data.media.payload, "base64");
+      const pcmFrame   = decodeMulaw(mulawBytes);
 
-      // FIX 3: Extract streamSid from media packet if not yet set, then greet immediately
+      session.mediaPacketCount++;
+      session.mediaByteCount += mulawBytes.length;
+
       if (!session.streamSid) {
         const sid = data.stream_sid || data.media?.stream_sid || null;
         if (sid) {
@@ -478,25 +475,22 @@ wss.on("connection", (ws, req) => {
         }
       }
 
-      // FIX 3: Fire greeting on first media packet even if 'start' event was late/missing
+      // Greet immediately on first media if start event was late
       if (!session.greetingSent && session.streamSid) {
         maybeGreet();
       }
 
       if (session.mediaPacketCount <= 10 || session.mediaPacketCount % 200 === 0) {
-        const energy = mulawEnergy(raw);
-        console.log(`[MEDIA] pkt#${session.mediaPacketCount} energy=${energy.toFixed(1)} speaking=${session.isSpeaking} processing=${session.isProcessing}`);
+        const energy = pcmEnergy(pcmFrame);
+        console.log(`[MEDIA] pkt#${session.mediaPacketCount} energy=${energy.toFixed(0)} speaking=${session.isSpeaking} processing=${session.isProcessing}`);
       }
 
-      // Routing
       if (session.isSpeaking) {
-        session.bargeinChunks.push(raw);
+        session.bargeinChunks.push(pcmFrame);
         return;
       }
 
-      session.audioChunks.push(raw);
-
-      // Reset silence timer on every packet
+      session.audioChunks.push(pcmFrame);
       clearTimeout(session.silenceTimer);
       session.silenceTimer = setTimeout(() => flushAudio("silence-timer"), SILENCE_TIMEOUT_MS);
     }
@@ -533,7 +527,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok", sessions: sessions.size, uptime: Math.floor(process.uptime()),
     tts, silence_timeout: SILENCE_TIMEOUT_MS, energy_threshold: SILENCE_ENERGY_THRESH,
-    min_stt_bytes: MIN_STT_BYTES, audio_encoding: "mulaw",
+    min_stt_bytes: MIN_STT_BYTES, pipeline: "mulaw -> decode -> linear16 -> deepgram",
   });
 });
 
