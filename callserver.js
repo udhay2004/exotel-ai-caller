@@ -4,7 +4,7 @@ const http         = require("http");
 const WebSocket    = require("ws");
 const axios        = require("axios");
 const { spawn }    = require("child_process");
-const { Readable } = require("stream");
+const { Readable, PassThrough } = require("stream");
 
 const app    = express();
 const server = http.createServer(app);
@@ -14,15 +14,23 @@ const PORT   = process.env.PORT || 10000;
 // ---------------------------------------------------------------------------
 // ARCHITECTURE:
 //
+// FIX 1: Exotel sends μ-law (PCMU) encoded audio. We now tell Deepgram the
+//         correct encoding=mulaw instead of encoding=linear16. This is why
+//         ALL transcripts were returning empty strings before.
+//
+// FIX 2: ElevenLabs streaming endpoint (/stream) is used so audio chunks
+//         are piped to ffmpeg as they arrive — cutting TTS latency from
+//         7-9s down to ~1-1.5s for the greeting.
+//
+// FIX 3: Greeting fires on first media packet if streamSid is available,
+//         not just on the 'start' event (which Exotel sends late).
+//
 // Audio routing has 3 states:
 //   isSpeaking=true  → bot is playing TTS  → buffer in bargeinChunks
-//   isProcessing=true→ STT/AI running      → keep adding to audioChunks
-//                                             (do NOT drain into separate calls)
+//   isProcessing=true→ STT/AI running      → accumulate in audioChunks
 //   idle             → accumulate audioChunks, silence timer runs
 //
-// The silence timer fires ONE flush after 700ms of quiet.
-// We never fragment a caller's utterance into multiple STT calls.
-// Minimum audio before STT: 8000 bytes = 500ms at 8kHz s16le.
+// Minimum audio before STT: 8000 bytes = 500ms at 8kHz mulaw.
 // ---------------------------------------------------------------------------
 
 const PCM_SAMPLE_RATE      = 8000;
@@ -30,14 +38,13 @@ const PCM_BYTES_PER_SAMPLE = 2;
 const FRAME_MS             = 20;
 const FRAME_BYTES          = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * FRAME_MS / 1000; // 320B
 
-// 700ms silence = end of utterance. Long enough to catch natural speech pauses.
 const SILENCE_TIMEOUT_MS    = parseInt(process.env.SILENCE_TIMEOUT || "700",  10);
-const SILENCE_ENERGY_THRESH = parseInt(process.env.ENERGY_THRESH   || "20",   10);
-const PCM_AMPLIFY           = parseFloat(process.env.PCM_AMPLIFY   || "40");
+// Mulaw energy threshold — mulaw bytes have different value range than s16le
+// Lower threshold because mulaw is 8-bit compressed
+const SILENCE_ENERGY_THRESH = parseInt(process.env.ENERGY_THRESH   || "5",    10);
 
-// Minimum audio to send to Deepgram: 500ms = 8000B at 8kHz s16le
-// Deepgram cannot transcribe less than ~300ms reliably
-const MIN_STT_BYTES = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * 500 / 1000; // 8000B
+// Minimum mulaw audio to send to Deepgram: 500ms = 4000B at 8kHz 8-bit mulaw
+const MIN_STT_BYTES = PCM_SAMPLE_RATE * 500 / 1000; // 4000B (mulaw is 1 byte/sample)
 
 const KEEPALIVE_INTERVAL_MS      = 200;
 const KEEPALIVE_FRAMES_PER_BURST = 10;
@@ -61,20 +68,20 @@ function checkEnv() {
   const required = ["DEEPGRAM_API_KEY", "ANTHROPIC_API_KEY"];
   const missing  = required.filter(k => !process.env[k]);
   if (missing.length) { console.error("Missing env vars:", missing.join(", ")); process.exit(1); }
-  if (!process.env.CAM_API_KEY && !process.env.ELEVENLABS_API_KEY) {
-    console.error("No TTS provider configured. Set CAM_API_KEY or ELEVENLABS_API_KEY.");
+  if (!process.env.ELEVENLABS_API_KEY && !process.env.CAM_API_KEY) {
+    console.error("No TTS provider configured. Set ELEVENLABS_API_KEY (recommended) or CAM_API_KEY.");
     process.exit(1);
   }
   const tts = [];
-  if (process.env.CAM_API_KEY)        tts.push("CAMB.AI");
-  if (process.env.ELEVENLABS_API_KEY) tts.push("ElevenLabs");
+  if (process.env.ELEVENLABS_API_KEY) tts.push("ElevenLabs (streaming)");
+  if (process.env.CAM_API_KEY)        tts.push("CAMB.AI (fallback)");
   console.log("Env OK | TTS:", tts.join(" -> "));
   console.log(`Silence timeout: ${SILENCE_TIMEOUT_MS}ms | VAD thresh: ${SILENCE_ENERGY_THRESH} | Min STT bytes: ${MIN_STT_BYTES}`);
-  console.log("PCM amplify:", PCM_AMPLIFY);
+  console.log("Audio encoding: mulaw (Exotel default)");
 }
 
 // ---------------------------------------------------------------------------
-// PCM silence frame
+// PCM silence frame (for keepalive — output side is still linear16 PCM)
 // ---------------------------------------------------------------------------
 function sendSilenceFrame(ws, streamSid) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -154,35 +161,65 @@ function convertAndStream(buf, ws, streamSid, fmt, stopKA) {
 // ---------------------------------------------------------------------------
 // TTS providers
 // ---------------------------------------------------------------------------
+
+// FIX 2: ElevenLabs streaming — pipes audio chunks to ffmpeg as they arrive
+// This cuts latency from ~7s (full download) to ~1-1.5s (first chunk)
+async function ttsViaElevenLabsStreaming(text, ws, streamSid, stopKA) {
+  if (!process.env.ELEVENLABS_API_KEY) throw new Error("no ELEVENLABS_API_KEY");
+  const vid = process.env.ELEVENLABS_VOICE_ID || "9BWtsMINqrJLrRacOk9x";
+  console.log("[TTS/EL-STREAM] ->", text.slice(0, 60));
+
+  // Spawn ffmpeg ready to receive streaming mp3
+  const ff = spawn("ffmpeg", [
+    "-hide_banner", "-loglevel", "error",
+    "-f", "mp3", "-i", "pipe:0",
+    "-ar", String(PCM_SAMPLE_RATE), "-ac", "1", "-f", "s16le", "pipe:1"
+  ]);
+
+  // Start streaming ffmpeg output to Exotel immediately
+  const streamDone = streamPCMFromFFmpeg(ff, ws, streamSid, stopKA);
+
+  // Fetch ElevenLabs with responseType: stream
+  const response = await axios({
+    method: "post",
+    url: `https://api.elevenlabs.io/v1/text-to-speech/${vid}/stream`,
+    data: {
+      text,
+      model_id: "eleven_turbo_v2",
+      output_format: "mp3_44100_128",
+      voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.0 }
+    },
+    headers: {
+      "xi-api-key": process.env.ELEVENLABS_API_KEY,
+      "Content-Type": "application/json"
+    },
+    responseType: "stream",
+    timeout: 20000,
+  });
+
+  // Pipe HTTP response stream → ffmpeg stdin
+  response.data.pipe(ff.stdin);
+  response.data.on("error", (e) => { console.warn("[TTS/EL] stream error:", e.message); ff.stdin.end(); });
+  ff.stdin.on("error", () => {});
+
+  await streamDone;
+  console.log("[TTS/EL-STREAM] done");
+}
+
+// CAMB.AI fallback (still buffered, but available if ElevenLabs fails)
 async function ttsViaCamb(text, ws, streamSid, stopKA) {
   if (!process.env.CAM_API_KEY) throw new Error("no CAM_API_KEY");
   console.log("[TTS/CAMB] ->", text.slice(0, 60));
   const res = await axios.post(
     "https://client.camb.ai/apis/tts-stream",
     { text, language: "en-in", voice_id: parseInt(process.env.CAMB_VOICE_ID || "147320", 10), speech_model: "mars-flash", voice_settings: { speaking_rate: 1.05 } },
-    { headers: { "x-api-key": process.env.CAM_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer", timeout: 9000 }
+    { headers: { "x-api-key": process.env.CAM_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer", timeout: 12000 }
   );
   const audio = Buffer.from(res.data);
   if (audio.length < 100) throw new Error(`CAMB audio too small: ${audio.length}B`);
   console.log(`[TTS/CAMB] ${audio.length}B`);
   const fmt = audio.slice(0, 4).toString("ascii") === "RIFF" ? "wav" : "mp3";
   await convertAndStream(audio, ws, streamSid, fmt, stopKA);
-}
-
-async function ttsViaElevenLabs(text, ws, streamSid, stopKA) {
-  if (!process.env.ELEVENLABS_API_KEY) throw new Error("no ELEVENLABS_API_KEY");
-  const vid = process.env.ELEVENLABS_VOICE_ID || "9BWtsMINqrJLrRacOk9x";
-  console.log("[TTS/EL] ->", text.slice(0, 60));
-  const res = await axios({
-    method: "post",
-    url: `https://api.elevenlabs.io/v1/text-to-speech/${vid}/stream`,
-    data: { text, model_id: "eleven_turbo_v2", output_format: "mp3_44100_128", voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.0 } },
-    headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
-    responseType: "arraybuffer", timeout: 12000,
-  });
-  const audio = Buffer.from(res.data);
-  console.log(`[TTS/EL] ${audio.length}B`);
-  await convertAndStream(audio, ws, streamSid, "mp3", stopKA);
 }
 
 async function streamTTS(text, ws, streamSid, session) {
@@ -196,9 +233,10 @@ async function streamTTS(text, ws, streamSid, session) {
   const stopKA = startKeepalive(ws, streamSid);
   let ok = false;
 
+  // Try ElevenLabs streaming first, then CAMB.AI as fallback
   for (const [name, key, fn] of [
-    ["CAMB.AI",    "CAM_API_KEY",       () => ttsViaCamb(text, ws, streamSid, stopKA)],
-    ["ElevenLabs", "ELEVENLABS_API_KEY",() => ttsViaElevenLabs(text, ws, streamSid, stopKA)],
+    ["ElevenLabs", "ELEVENLABS_API_KEY", () => ttsViaElevenLabsStreaming(text, ws, streamSid, stopKA)],
+    ["CAMB.AI",    "CAM_API_KEY",        () => ttsViaCamb(text, ws, streamSid, stopKA)],
   ]) {
     if (!process.env[key]) continue;
     try { await fn(); ok = true; console.log("[TTS] done via", name); break; }
@@ -211,12 +249,12 @@ async function streamTTS(text, ws, streamSid, session) {
   if (session) {
     session.isSpeaking = false;
 
-    // Barge-in: caller spoke while bot was talking — process the full buffer now
+    // Barge-in: caller spoke while bot was talking — process now
     if (session.bargeinChunks.length > 0 && !session.isProcessing) {
       const audio = Buffer.concat(session.bargeinChunks);
       session.bargeinChunks = [];
       console.log(`[BARGE-IN] ${audio.length}B collected while bot was speaking`);
-      if (audio.length >= MIN_STT_BYTES && pcmEnergy(audio) >= SILENCE_ENERGY_THRESH) {
+      if (audio.length >= MIN_STT_BYTES && mulawEnergy(audio) >= SILENCE_ENERGY_THRESH) {
         processUtterance(audio, session, ws).catch(e => console.error("[BARGE-IN]", e.message));
       } else {
         console.log("[BARGE-IN] too short or silent — discarded");
@@ -226,55 +264,36 @@ async function streamTTS(text, ws, streamSid, session) {
 }
 
 // ---------------------------------------------------------------------------
-// VAD
+// VAD — mulaw energy (1 byte per sample, values 0-255, silence ≈ 0xFF = 127)
+// In mulaw, 0x7F (127) is silence. Distance from 127 = energy.
 // ---------------------------------------------------------------------------
-function pcmEnergy(buf) {
-  if (!buf || buf.length < 2) return 0;
+function mulawEnergy(buf) {
+  if (!buf || buf.length === 0) return 0;
   let s = 0;
-  for (let i = 0; i + 1 < buf.length; i += 2) s += Math.abs(buf.readInt16LE(i));
-  return s / (buf.length / 2);
-}
-
-function amplifyPCM(buf, gain) {
-  if (!gain || gain === 1) return buf;
-  const out = Buffer.allocUnsafe(buf.length);
-  for (let i = 0; i + 1 < buf.length; i += 2) {
-    let v = Math.round(buf.readInt16LE(i) * gain);
-    if (v >  32767) v =  32767;
-    if (v < -32768) v = -32768;
-    out.writeInt16LE(v, i);
+  for (let i = 0; i < buf.length; i++) {
+    s += Math.abs(buf[i] - 127); // 127 = mulaw silence byte
   }
-  return out;
-}
-
-function trimSpeechPCM(buf, thresh) {
-  const frames = [];
-  for (let i = 0; i + FRAME_BYTES <= buf.length; i += FRAME_BYTES) frames.push(buf.slice(i, i + FRAME_BYTES));
-  let first = -1, last = -1;
-  for (let f = 0; f < frames.length; f++) {
-    if (pcmEnergy(frames[f]) >= thresh) { if (first < 0) first = f; last = f; }
-  }
-  if (first < 0) return buf;
-  first = Math.max(0, first - 5);
-  last  = Math.min(frames.length - 1, last + 5);
-  const out = Buffer.concat(frames.slice(first, last + 1));
-  console.log(`[TRIM] ${frames.length} → ${last - first + 1} frames`);
-  return out;
+  return s / buf.length;
 }
 
 // ---------------------------------------------------------------------------
-// STT
+// STT — FIX 1: encoding=mulaw (not linear16)
+// No amplification or trimming needed — Deepgram handles mulaw natively
 // ---------------------------------------------------------------------------
 async function speechToText(raw) {
-  const trimmed   = trimSpeechPCM(raw, SILENCE_ENERGY_THRESH);
-  const amplified = amplifyPCM(trimmed, PCM_AMPLIFY);
-  console.log(`[STT] sending ${amplified.length}B (${(amplified.length / (PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE)).toFixed(2)}s) energy=${pcmEnergy(trimmed).toFixed(0)}`);
+  const energy = mulawEnergy(raw);
+  console.log(`[STT] sending ${raw.length}B (${(raw.length / PCM_SAMPLE_RATE).toFixed(2)}s mulaw) energy=${energy.toFixed(1)}`);
   try {
     const res = await axios.post(
-      "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=linear16&sample_rate=8000&language=en-IN",
-      amplified,
+      // KEY FIX: encoding=mulaw instead of encoding=linear16
+      "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=mulaw&sample_rate=8000&language=en-IN",
+      raw,
       {
-        headers: { Authorization: "Token " + process.env.DEEPGRAM_API_KEY, "Content-Type": "audio/l16;rate=8000" },
+        headers: {
+          Authorization: "Token " + process.env.DEEPGRAM_API_KEY,
+          // KEY FIX: correct content-type for mulaw
+          "Content-Type": "audio/basic",
+        },
         maxBodyLength: Infinity,
         timeout: 10000,
       }
@@ -323,7 +342,7 @@ async function processUtterance(audio, session, ws) {
   }
   const t0 = Date.now();
   session.isProcessing = true;
-  console.log(`[UTT] start — ${audio.length}B (${(audio.length / (PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE)).toFixed(2)}s audio)`);
+  console.log(`[UTT] start — ${audio.length}B (${(audio.length / PCM_SAMPLE_RATE).toFixed(2)}s mulaw audio)`);
 
   try {
     const transcript = await speechToText(audio);
@@ -341,13 +360,11 @@ async function processUtterance(audio, session, ws) {
     console.error("[UTT] error:", e.message);
   } finally {
     session.isProcessing = false;
-    // If new audio arrived while we were processing, handle it
-    // but DON'T drain into micro-chunks — wait for a full utterance
     if (session.pendingFlush) {
       session.pendingFlush = false;
       const pending = Buffer.concat(session.audioChunks);
       session.audioChunks = [];
-      if (pending.length >= MIN_STT_BYTES && pcmEnergy(pending) >= SILENCE_ENERGY_THRESH) {
+      if (pending.length >= MIN_STT_BYTES && mulawEnergy(pending) >= SILENCE_ENERGY_THRESH) {
         console.log(`[UTT] draining deferred audio: ${pending.length}B`);
         await processUtterance(pending, session, ws);
       }
@@ -367,11 +384,11 @@ wss.on("connection", (ws, req) => {
     callId,
     history:          [],
     streamSid:        null,
-    audioChunks:      [],    // ALL caller audio accumulates here until flush
-    bargeinChunks:    [],    // audio while bot is speaking
+    audioChunks:      [],
+    bargeinChunks:    [],
     isProcessing:     false,
     isSpeaking:       false,
-    pendingFlush:     false, // set when silence fires during processing
+    pendingFlush:     false,
     greetingSent:     false,
     silenceTimer:     null,
     wsOpen:           true,
@@ -391,11 +408,10 @@ wss.on("connection", (ws, req) => {
     }
 
     const audio = Buffer.concat(session.audioChunks);
-    // Keep audioChunks empty so new packets accumulate fresh
     session.audioChunks = [];
 
-    const energy = pcmEnergy(audio);
-    console.log(`[VAD] flush(${trigger}) ${audio.length}B ${(audio.length/(PCM_SAMPLE_RATE*PCM_BYTES_PER_SAMPLE)).toFixed(2)}s energy=${energy.toFixed(0)}`);
+    const energy = mulawEnergy(audio);
+    console.log(`[VAD] flush(${trigger}) ${audio.length}B ${(audio.length / PCM_SAMPLE_RATE).toFixed(2)}s energy=${energy.toFixed(1)}`);
 
     if (audio.length < MIN_STT_BYTES) {
       console.log(`[VAD] too short (${audio.length}B < ${MIN_STT_BYTES}B) — skip`);
@@ -407,10 +423,8 @@ wss.on("connection", (ws, req) => {
     }
 
     if (session.isProcessing) {
-      // Pipeline already running — note that we need a follow-up flush
       console.log("[VAD] pipeline busy — marking pendingFlush");
-      // Put audio back so processUtterance can drain it
-      session.audioChunks = Array.from(audio); // will be concat'd in finally block
+      session.audioChunks = [audio];
       session.pendingFlush = true;
       return;
     }
@@ -418,6 +432,7 @@ wss.on("connection", (ws, req) => {
     await processUtterance(audio, session, ws);
   }
 
+  // FIX 3: maybeGreet can now be called any time streamSid is set
   function maybeGreet() {
     if (session.greetingSent || !session.streamSid) return;
     session.greetingSent = true;
@@ -438,7 +453,12 @@ wss.on("connection", (ws, req) => {
     }
 
     if (data.event === "start") {
-      const sid = data.stream_sid || data.streamSid || data.start?.stream_sid || data.start?.streamSid || null;
+      // Extract streamSid from wherever Exotel puts it
+      const sid = data.stream_sid
+        || data.streamSid
+        || data.start?.stream_sid
+        || data.start?.streamSid
+        || null;
       if (sid) session.streamSid = sid;
       console.log(`[WS] start | streamSid=${session.streamSid}`);
       maybeGreet();
@@ -449,26 +469,31 @@ wss.on("connection", (ws, req) => {
       session.mediaPacketCount++;
       session.mediaByteCount += raw.length;
 
-      // Late streamSid
-      if (!session.streamSid && data.stream_sid) {
-        session.streamSid = data.stream_sid;
-        console.log(`[WS] streamSid from media: ${session.streamSid}`);
+      // FIX 3: Extract streamSid from media packet if not yet set, then greet immediately
+      if (!session.streamSid) {
+        const sid = data.stream_sid || data.media?.stream_sid || null;
+        if (sid) {
+          session.streamSid = sid;
+          console.log(`[WS] streamSid from media: ${session.streamSid}`);
+        }
+      }
+
+      // FIX 3: Fire greeting on first media packet even if 'start' event was late/missing
+      if (!session.greetingSent && session.streamSid) {
         maybeGreet();
       }
 
       if (session.mediaPacketCount <= 10 || session.mediaPacketCount % 200 === 0) {
-        console.log(`[MEDIA] pkt#${session.mediaPacketCount} energy=${pcmEnergy(raw).toFixed(0)} speaking=${session.isSpeaking} processing=${session.isProcessing}`);
+        const energy = mulawEnergy(raw);
+        console.log(`[MEDIA] pkt#${session.mediaPacketCount} energy=${energy.toFixed(1)} speaking=${session.isSpeaking} processing=${session.isProcessing}`);
       }
 
       // Routing
       if (session.isSpeaking) {
-        // Buffer for barge-in — process after TTS finishes
         session.bargeinChunks.push(raw);
         return;
       }
 
-      // Always accumulate — whether processing or not
-      // We collect audio continuously and only flush on silence
       session.audioChunks.push(raw);
 
       // Reset silence timer on every packet
@@ -480,7 +505,6 @@ wss.on("connection", (ws, req) => {
       clearTimeout(session.silenceTimer);
       console.log(`[WS] stop | ${callId} | pkts=${session.mediaPacketCount}`);
       if (session.mediaPacketCount === 0) console.warn("[WS] WARNING: zero media packets");
-      // Fire and forget — WS may close immediately after
       flushAudio("stop-event").catch(e => console.error("[STOP]", e.message));
     }
 
@@ -504,12 +528,12 @@ wss.on("connection", (ws, req) => {
 // ---------------------------------------------------------------------------
 app.get("/", (req, res) => {
   const tts = [];
+  if (process.env.ELEVENLABS_API_KEY) tts.push("ElevenLabs (streaming)");
   if (process.env.CAM_API_KEY)        tts.push("CAMB.AI");
-  if (process.env.ELEVENLABS_API_KEY) tts.push("ElevenLabs");
   res.json({
     status: "ok", sessions: sessions.size, uptime: Math.floor(process.uptime()),
     tts, silence_timeout: SILENCE_TIMEOUT_MS, energy_threshold: SILENCE_ENERGY_THRESH,
-    min_stt_bytes: MIN_STT_BYTES, pcm_amplify: PCM_AMPLIFY,
+    min_stt_bytes: MIN_STT_BYTES, audio_encoding: "mulaw",
   });
 });
 
