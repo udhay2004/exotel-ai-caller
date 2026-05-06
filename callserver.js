@@ -36,6 +36,20 @@ const PORT   = process.env.PORT || 10000;
 //   BUG-6: isSpeaking never false-guarded after TTS provider error, causing
 //          permanent speaking=true deadlock. Fix: always set isSpeaking=false
 //          in a try/finally inside streamTTS.
+//
+// BUGS FIXED (v3 — from live log analysis):
+//   BUG-7 (ROOT CAUSE of post-greeting silence): Silence timer was re-armed on
+//          EVERY packet once hasSpeech=true — including the 50/s energy=9 silence
+//          frames that follow speech. Each silent frame reset the 900ms countdown,
+//          so the timer NEVER fired. The caller could speak for 3 seconds and
+//          get 150 × 900ms resets — the flush never happened.
+//          Fix: only re-arm the silence timer when a speech-energy packet arrives
+//          (energy >= ENERGY_THRESH). Silent frames after speech are accumulated
+//          but do NOT touch the timer. Timer armed once at speech-start, then
+//          only reset when MORE speech arrives (natural inter-word pauses work).
+//   BUG-8: silenceEndedAt / last-speech-time tracking was absent, making it
+//          impossible to enforce a true "N ms of silence after speech" window.
+//          Fix: track lastSpeechAt timestamp; use it for diagnostic logging.
 // ===========================================================================
 
 const SAMPLE_RATE   = 8000;
@@ -297,6 +311,7 @@ async function streamTTS(text, ws, streamSid, session) {
   session.audioChunks     = [];
   session.hasSpeech       = false;
   session.speechEnergy    = 0;
+  session.lastSpeechAt    = 0;
   session.bargeinChunks   = [];   // start fresh barge-in collection
 
   session.isSpeaking      = true;
@@ -499,8 +514,9 @@ async function processUtterance(pcmBuf, session, ws) {
         const deferred      = Buffer.concat(session.audioChunks);
         session.audioChunks = [];
         // Reset VAD latch — this is a fresh evaluation of the deferred audio
-        session.hasSpeech   = false;
+        session.hasSpeech    = false;
         session.speechEnergy = 0;
+        session.lastSpeechAt = 0;
 
         const energy = pcmEnergy(deferred);
         log.utt(`draining deferred | ${deferred.length}B | energy=${energy.toFixed(0)}`);
@@ -533,6 +549,7 @@ function flushAudioForSession(session, ws, trigger) {
   const hadSpeech      = session.hasSpeech;
   session.hasSpeech    = false;
   session.speechEnergy = 0;
+  session.lastSpeechAt = 0;
 
   if (session.audioChunks.length === 0) {
     log.vad(`flush(${trigger}) — buffer empty, skip`);
@@ -600,7 +617,8 @@ wss.on("connection", (ws, req) => {
 
     // VAD state
     hasSpeech:      false,  // latched true once a frame >= ENERGY_THRESH seen
-    speechEnergy:   0,      // running max for diagnostics
+    speechEnergy:   0,      // running max energy seen in this utterance
+    lastSpeechAt:   0,      // Date.now() of last speech-energy packet (for diagnostics)
     silenceTimer:   null,
 
     // Lifecycle
@@ -701,23 +719,37 @@ wss.on("connection", (ws, req) => {
         }
         session.hasSpeech    = true;
         session.speechEnergy = Math.max(session.speechEnergy, energy);
-      }
+        session.lastSpeechAt = Date.now();
 
-      if (session.hasSpeech) {
-        // Arm / re-arm silence countdown from last speech-level frame
+        // -----------------------------------------------------------------
+        // BUG-7 FIX: Re-arm the silence timer ONLY on speech-energy packets.
+        //
+        // BEFORE (broken): timer was reset inside `if (session.hasSpeech)`,
+        // which ran on EVERY packet — including the 50 silent frames/sec
+        // that follow speech (energy=9). Each silent frame postponed the
+        // 900ms countdown indefinitely → flushAudio() NEVER fired.
+        //
+        // AFTER (correct): timer is reset only here, inside the energy>=THRESH
+        // branch. Silent frames after speech do NOT touch the timer.
+        // The timer armed on the last speech-energy frame counts down cleanly
+        // through subsequent silence and fires exactly SILENCE_MS after the
+        // caller stopped speaking.
+        // -----------------------------------------------------------------
         clearTimeout(session.silenceTimer);
         session.silenceTimer = setTimeout(
           () => flushAudioForSession(session, ws, "silence-timer"),
           SILENCE_MS
         );
+      }
 
+      if (session.hasSpeech) {
         // Guard: max utterance length — force flush to prevent runaway buffer
         const accumulated = session.audioChunks.reduce((s, c) => s + c.length, 0);
         if (accumulated >= MAX_UTT_BYTES) {
-          log.vad(`max utterance reached (${accumulated}B >= ${MAX_UTT_BYTES}B) — forcing flush`);
+          const silentMs = session.lastSpeechAt ? Date.now() - session.lastSpeechAt : 0;
+          log.vad(`max utterance reached (${accumulated}B >= ${MAX_UTT_BYTES}B) | silent for ${silentMs}ms — forcing flush`);
           flushAudioForSession(session, ws, "max-utterance");
         }
-
       } else {
         // BUG-5 FIX: Cap pre-speech silence accumulation.
         // Without this, several seconds of silence before the caller first
