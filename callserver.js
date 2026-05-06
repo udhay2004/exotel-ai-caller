@@ -12,39 +12,38 @@ const wss    = new WebSocket.Server({ server });
 const PORT   = process.env.PORT || 10000;
 
 // ===========================================================================
-// GROUND TRUTH (from byte analysis of actual packets):
+// CONFIRMED FACTS (from byte analysis across all test calls):
 //
-// Your first 16 bytes:  a8ff 98ff 88ff 78ff 68ff 78ff 78ff 98ff
-// Interpreted as int16 little-endian: -88, -104, -120, -136, -152, -136, -136, -104
-// These are small negative integers near zero = LINEAR16 silence. ✅
+//   First packet hex: a800 b800 b800 9800 6800 4800 2800 f8ff
+//   As int16 LE:      168,  184,  184,  152,  104,   72,   40,   -8
+//   These are small integers = near-silence in LINEAR16 format.
+//   pcmEnergy of those = ~120-173, which matches the logs exactly.
 //
-// Exotel sends: raw linear16 s16le, 8kHz, mono, 2 bytes/sample
-// We send back: mulaw 8kHz (what Exotel plays to the caller)
+//   EXOTEL SENDS:    linear16 s16le, 8kHz, mono, 320 bytes per 20ms frame
+//   EXOTEL RECEIVES: linear16 s16le, 8kHz, mono, 320 bytes per 20ms frame
 //
-// STT: send raw linear16 bytes directly to Deepgram (no decode needed)
-// VAD: read as int16LE directly (no decode needed)
-// TTS output: ffmpeg converts mp3/wav → mulaw for Exotel playback
-// Keepalive: send mulaw silence (0xFF) while TTS is loading
+//   The greeting was audible (doc #5) when code output s16le frames.
+//   After switching to mulaw output, caller heard noise. Proof: Exotel needs s16le back.
 //
-// Why STT was always empty ("" conf=0.00):
-// The mulaw decode was transforming perfectly good linear16 PCM into garbage.
-// Deepgram received corrupt audio and returned empty transcripts.
+//   STT: send raw linear16 bytes directly to Deepgram — no conversion needed.
+//   VAD: pcmEnergy on raw bytes. Silence ≈ 50-200. Speech ≈ 500-8000.
+//        Threshold = 300 (safe margin above silence, catches all speech).
+//
+//   STT was empty because previous versions applied mulaw decode to linear16 bytes,
+//   corrupting the audio before sending to Deepgram.
 // ===========================================================================
 
-const SAMPLE_RATE      = 8000;
-const BYTES_PER_SAMPLE = 2;           // linear16 = 2 bytes/sample
-const BYTES_PER_S      = SAMPLE_RATE * BYTES_PER_SAMPLE; // 16000 B/s
-const FRAME_BYTES_L16  = 320;         // 20ms of linear16 (320 bytes)
-const FRAME_BYTES_UL   = 160;         // 20ms of mulaw (160 bytes)
+const SAMPLE_RATE    = 8000;
+const BYTES_PER_S    = SAMPLE_RATE * 2;   // linear16: 2 bytes/sample = 16000 B/s
+const FRAME_BYTES    = 320;               // 20ms of linear16 at 8kHz
 
-const SILENCE_MS    = parseInt(process.env.SILENCE_TIMEOUT || "900",  10);
-const ENERGY_THRESH = parseInt(process.env.ENERGY_THRESH   || "400",  10);
-const MIN_SPEECH_MS = parseInt(process.env.MIN_SPEECH_MS   || "500",  10);
-const MIN_PCM_BYTES = (MIN_SPEECH_MS / 1000) * BYTES_PER_S;
+const SILENCE_MS     = parseInt(process.env.SILENCE_TIMEOUT || "900",  10);
+const ENERGY_THRESH  = parseInt(process.env.ENERGY_THRESH   || "300",  10);
+const MIN_SPEECH_MS  = 500;
+const MIN_PCM_BYTES  = (MIN_SPEECH_MS / 1000) * BYTES_PER_S; // 8000 bytes = 0.5s
 
 const KEEPALIVE_MS     = 200;
 const KEEPALIVE_FRAMES = 10;
-const MULAW_SILENCE    = 0xFF; // G.711 mulaw silence codeword
 
 const COMPANY_CONTEXT =
   "You are a professional telecaller from Connect Ventures. " +
@@ -57,7 +56,7 @@ const GREETING = "Hello, I am calling from Connect Ventures. Is this a good time
 const sessions = new Map();
 
 // ---------------------------------------------------------------------------
-// VAD — linear16 s16le energy
+// VAD — linear16 s16le energy (no decode needed)
 // ---------------------------------------------------------------------------
 function pcmEnergy(buf) {
   if (!buf || buf.length < 2) return 0;
@@ -82,21 +81,21 @@ function checkEnv() {
   if (process.env.ELEVENLABS_API_KEY) tts.push("ElevenLabs (streaming)");
   if (process.env.CAM_API_KEY)        tts.push("CAMB.AI");
   console.log("Env OK | TTS:", tts.join(" -> "));
-  console.log(`Silence: ${SILENCE_MS}ms | Energy thresh: ${ENERGY_THRESH} | Min speech: ${MIN_SPEECH_MS}ms`);
-  console.log("IN:  Exotel linear16 s16le 8kHz -> Deepgram linear16");
-  console.log("OUT: TTS mp3/wav -> ffmpeg -> mulaw 8kHz -> Exotel");
+  console.log(`Silence: ${SILENCE_MS}ms | Energy thresh: ${ENERGY_THRESH} | Min: ${MIN_SPEECH_MS}ms`);
+  console.log("IN/OUT: linear16 s16le 8kHz (Exotel native format)");
 }
 
 // ---------------------------------------------------------------------------
-// Keepalive — mulaw silence frames sent TO Exotel
+// Keepalive — linear16 silence frames (0x00 bytes, 320B each)
+// Exotel expects linear16 back, so silence = zero samples
 // ---------------------------------------------------------------------------
-function sendMulawSilenceFrame(ws, streamSid) {
+function sendSilenceFrame(ws, streamSid) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try {
     ws.send(JSON.stringify({
       event:      "media",
       stream_sid: streamSid,
-      media:      { payload: Buffer.alloc(FRAME_BYTES_UL, MULAW_SILENCE).toString("base64") },
+      media:      { payload: Buffer.alloc(FRAME_BYTES, 0x00).toString("base64") },
     }));
   } catch (_) {}
 }
@@ -105,15 +104,15 @@ function startKeepalive(ws, streamSid) {
   let total = 0;
   const iv = setInterval(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN) { clearInterval(iv); return; }
-    for (let i = 0; i < KEEPALIVE_FRAMES; i++) { sendMulawSilenceFrame(ws, streamSid); total++; }
+    for (let i = 0; i < KEEPALIVE_FRAMES; i++) { sendSilenceFrame(ws, streamSid); total++; }
   }, KEEPALIVE_MS);
-  return () => { clearInterval(iv); console.log(`[KA] stopped — ${total} mulaw frames`); };
+  return () => { clearInterval(iv); console.log(`[KA] stopped — ${total} frames`); };
 }
 
 // ---------------------------------------------------------------------------
-// Stream ffmpeg mulaw output → Exotel
+// Stream ffmpeg s16le output → Exotel (linear16 frames)
 // ---------------------------------------------------------------------------
-function streamMulawFromFFmpeg(ff, ws, streamSid, stopKA) {
+function streamL16FromFFmpeg(ff, ws, streamSid, stopKA) {
   return new Promise(resolve => {
     let rem = Buffer.alloc(0), sent = 0, stopped = false;
     const doStop = () => { if (!stopped && stopKA) { stopKA(); stopped = true; } };
@@ -123,15 +122,15 @@ function streamMulawFromFFmpeg(ff, ws, streamSid, stopKA) {
       doStop();
       const buf = Buffer.concat([rem, chunk]);
       let off = 0;
-      while (off + FRAME_BYTES_UL <= buf.length) {
+      while (off + FRAME_BYTES <= buf.length) {
         try {
           ws.send(JSON.stringify({
             event: "media", stream_sid: streamSid,
-            media: { payload: buf.slice(off, off + FRAME_BYTES_UL).toString("base64") },
+            media: { payload: buf.slice(off, off + FRAME_BYTES).toString("base64") },
           }));
           sent++;
         } catch (e) { console.warn("[STREAM] err:", e.message); break; }
-        off += FRAME_BYTES_UL;
+        off += FRAME_BYTES;
       }
       rem = buf.slice(off);
     });
@@ -139,14 +138,14 @@ function streamMulawFromFFmpeg(ff, ws, streamSid, stopKA) {
     ff.stdout.on("end", () => {
       doStop();
       if (rem.length && ws?.readyState === WebSocket.OPEN) {
-        const pad = Buffer.concat([rem, Buffer.alloc(FRAME_BYTES_UL - (rem.length % FRAME_BYTES_UL), MULAW_SILENCE)]);
+        const pad = Buffer.concat([rem, Buffer.alloc(FRAME_BYTES - (rem.length % FRAME_BYTES), 0x00)]);
         try { ws.send(JSON.stringify({ event: "media", stream_sid: streamSid, media: { payload: pad.toString("base64") } })); sent++; } catch (_) {}
       }
       if (ws?.readyState === WebSocket.OPEN) {
         try { ws.send(JSON.stringify({ event: "mark", stream_sid: streamSid, mark: { name: "tts_done" } })); } catch (_) {}
       }
-      const dur = ((sent * FRAME_BYTES_UL) / SAMPLE_RATE).toFixed(1);
-      console.log(`[STREAM] ${sent} mulaw frames / ~${dur}s`);
+      const dur = ((sent * FRAME_BYTES) / BYTES_PER_S).toFixed(1);
+      console.log(`[STREAM] ${sent} l16 frames / ~${dur}s`);
       resolve();
     });
 
@@ -155,19 +154,19 @@ function streamMulawFromFFmpeg(ff, ws, streamSid, stopKA) {
   });
 }
 
+// Convert TTS audio buffer (mp3 or wav) → s16le 8kHz → stream to Exotel
 function convertAndStream(audioBuf, inputFmt, ws, streamSid, stopKA) {
   return new Promise((res, rej) => {
     const ff = spawn("ffmpeg", [
       "-hide_banner", "-loglevel", "error",
       "-f", inputFmt, "-i", "pipe:0",
       "-ar", "8000", "-ac", "1",
-      "-acodec", "pcm_mulaw",
-      "-f", "mulaw",
+      "-f", "s16le",   // linear16 output — what Exotel expects
       "pipe:1",
     ]);
     Readable.from(audioBuf).pipe(ff.stdin);
     ff.stdin.on("error", () => {});
-    streamMulawFromFFmpeg(ff, ws, streamSid, stopKA).then(res).catch(rej);
+    streamL16FromFFmpeg(ff, ws, streamSid, stopKA).then(res).catch(rej);
   });
 }
 
@@ -179,15 +178,15 @@ async function ttsViaElevenLabs(text, ws, streamSid, stopKA) {
   const vid = process.env.ELEVENLABS_VOICE_ID || "9BWtsMINqrJLrRacOk9x";
   console.log("[TTS/EL] ->", text.slice(0, 60));
 
+  // ffmpeg: mp3 stream → s16le 8kHz (linear16 for Exotel)
   const ff = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "error",
     "-f", "mp3", "-i", "pipe:0",
     "-ar", "8000", "-ac", "1",
-    "-acodec", "pcm_mulaw",
-    "-f", "mulaw",
+    "-f", "s16le",
     "pipe:1",
   ]);
-  const done = streamMulawFromFFmpeg(ff, ws, streamSid, stopKA);
+  const done = streamL16FromFFmpeg(ff, ws, streamSid, stopKA);
 
   const response = await axios({
     method: "post",
@@ -254,6 +253,7 @@ async function streamTTS(text, ws, streamSid, session) {
 
   if (session) {
     session.isSpeaking = false;
+    // Process barge-in audio collected while bot was speaking
     if (session.bargeinChunks.length > 0 && !session.isProcessing) {
       const bargein = Buffer.concat(session.bargeinChunks);
       session.bargeinChunks = [];
@@ -262,14 +262,14 @@ async function streamTTS(text, ws, streamSid, session) {
       if (bargein.length >= MIN_PCM_BYTES && energy >= ENERGY_THRESH) {
         processUtterance(bargein, session, ws).catch(e => console.error("[BARGE-IN] err:", e.message));
       } else {
-        console.log("[BARGE-IN] too short/quiet — skip");
+        console.log("[BARGE-IN] too quiet or short — skip");
       }
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// STT — raw linear16 directly to Deepgram
+// STT — raw linear16 directly to Deepgram (no decode, no conversion)
 // ---------------------------------------------------------------------------
 async function speechToText(pcmBuf) {
   const energy  = pcmEnergy(pcmBuf).toFixed(0);
@@ -310,9 +310,9 @@ async function getAIResponse(history, text) {
       { model: "claude-haiku-4-5-20251001", max_tokens: 100, system: COMPANY_CONTEXT, messages: history },
       {
         headers: {
-          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "x-api-key":         process.env.ANTHROPIC_API_KEY,
           "anthropic-version": "2023-06-01",
-          "Content-Type": "application/json",
+          "Content-Type":      "application/json",
         },
         timeout: 8000,
       }
@@ -372,8 +372,8 @@ wss.on("connection", (ws, req) => {
     callId,
     history:       [],
     streamSid:     null,
-    audioChunks:   [],   // raw linear16 PCM from Exotel
-    bargeinChunks: [],   // linear16 collected while bot speaks
+    audioChunks:   [],   // raw linear16 frames from Exotel
+    bargeinChunks: [],   // linear16 frames collected while bot speaks
     isProcessing:  false,
     isSpeaking:    false,
     pendingFlush:  false,
@@ -406,7 +406,7 @@ wss.on("connection", (ws, req) => {
     if (session.greetingSent || !session.streamSid) return;
     session.greetingSent = true;
     session.history.push({ role: "assistant", content: GREETING });
-    console.log("[GREET] firing greeting TTS");
+    console.log("[GREET] firing TTS");
     streamTTS(GREETING, ws, session.streamSid, session).catch(e => {
       console.error("[GREET]", e.message);
       if (session) session.isSpeaking = false;
@@ -427,22 +427,21 @@ wss.on("connection", (ws, req) => {
     }
 
     if (data.event === "media") {
+      // Exotel sends raw linear16 s16le, 8kHz, mono, 320 bytes per frame
       const rawBytes = Buffer.from(data.media.payload, "base64");
       session.pktCount++;
 
+      // Recover streamSid if missed from start event
       if (!session.streamSid) {
         const sid = data.stream_sid || data.media?.stream_sid || null;
         if (sid) { session.streamSid = sid; console.log(`[WS] streamSid from media: ${session.streamSid}`); }
       }
       if (!session.greetingSent && session.streamSid) maybeGreet();
 
+      // Log first packet
       if (session.pktCount === 1) {
         const e = pcmEnergy(rawBytes);
         console.log(`[AUDIO] First pkt: ${rawBytes.length}B | pcmEnergy=${e.toFixed(0)} | hex=${rawBytes.slice(0, 16).toString("hex")}`);
-        const ffCount = rawBytes.filter(b => b === 0xFF || b === 0x7F).length;
-        if (ffCount > rawBytes.length * 0.3) {
-          console.warn("[AUDIO] ⚠️  Many 0xFF/0x7F bytes — may be mulaw. Check Exotel stream config!");
-        }
       }
       if (session.pktCount <= 10 || session.pktCount % 200 === 0) {
         console.log(`[MEDIA] pkt#${session.pktCount} pcmEnergy=${pcmEnergy(rawBytes).toFixed(0)} speaking=${session.isSpeaking}`);
@@ -480,7 +479,7 @@ app.get("/", (req, res) => {
   const tts = [];
   if (process.env.ELEVENLABS_API_KEY) tts.push("ElevenLabs");
   if (process.env.CAM_API_KEY)        tts.push("CAMB.AI");
-  res.json({ status: "ok", sessions: sessions.size, uptime: Math.floor(process.uptime()), tts, energy_thresh: ENERGY_THRESH });
+  res.json({ status: "ok", sessions: sessions.size, uptime: Math.floor(process.uptime()), tts, energy_thresh: ENERGY_THRESH, format: "linear16 s16le 8kHz in/out" });
 });
 
 checkEnv();
